@@ -1,19 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# sbgen — Sing-box configuration generator
-# ----------------------------------------
+# sbgen — Sing-box / Xray configuration generator
+# -----------------------------------------------
 # Author: Ivan Tarasov
 # Year: 2025
 # License: MIT
-#
-# Description:
-#   sbgen is a utility for generating Sing-box JSON configurations
-#   from templates (.tpl / .json) and YAML profiles.
-#   It automatically builds routing rules based on domain patterns
-#   and supports includes, multiple outputs, and profile merging.
-#
-# Repository: https://github.com/timfactory/sbgen
 
 import sys
 import os
@@ -21,13 +13,13 @@ import yaml
 import json
 import re
 import argparse
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 DEBUG = False
 
 def debug_print(msg: str):
     if DEBUG:
-        print(f"[DEBUG] {msg}", file=sys.stderr)
+        print(f">> {msg}", file=sys.stderr)
 
 # ---------- input normalization ----------
 def norm_list(x):
@@ -42,9 +34,8 @@ def norm_bool(x, default=True):
         return bool(default)
     return bool(x)
 
-# ---------- plain-text patterns loader ----------
+# ---------- patterns loader ----------
 def _strip_inline_comment(line: str) -> str:
-    r"""Remove inline comments starting with '#'. Use '\#' to keep a literal '#'. """
     out = []
     escaped = False
     for ch in line:
@@ -58,112 +49,80 @@ def _strip_inline_comment(line: str) -> str:
     return "".join(out).strip()
 
 def load_patterns_from_file(file_path: str) -> List[str]:
-    """Read a plain-text file: one pattern per line; empty lines and comments are ignored."""
-    patterns: List[str] = []
+    pats: List[str] = []
     with open(file_path, "r", encoding="utf-8") as f:
         for ln, line in enumerate(f, 1):
             raw = line.strip()
             if not raw or raw.startswith("#"):
                 continue
-            cleaned = _strip_inline_comment(line).strip()
-            if cleaned:
-                patterns.append(cleaned)
+            cl = _strip_inline_comment(line).strip()
+            if cl:
+                pats.append(cl)
             else:
-                debug_print(f"Include '{file_path}': line {ln} stripped to empty (comment only)")
-    return patterns
+                debug_print(f"{file_path}:{ln} comment only")
+    return pats
 
-# ---------- path resolving with base_dir precedence ----------
-def _first_existing(path_candidates: List[str]) -> Optional[str]:
-    for p in path_candidates:
-        if p and os.path.isfile(p):
-            return os.path.abspath(p)
-    return None
-
-def resolve_include_path(include: str,
-                         item_base: Optional[str],
-                         tid_base: Optional[str],
-                         cli_base: Optional[str]) -> Optional[str]:
-    """
-    Resolve relative 'include' path against the following base directories (in order):
-      1) item_base (per-item YAML file dir)
-      2) tid_base (per-profile base_dir from YAML)
-      3) cli_base (global --base-dir from CLI)
-      4) os.getcwd()
-    Absolute paths are used as-is.
-    Returns absolute path if exists, else None.
-    """
+# ---------- include path resolution ----------
+def resolve_include_path(include: str, item_base: Optional[str], tid_base: Optional[str], cli_base: Optional[str]) -> Optional[str]:
     if os.path.isabs(include):
         return include if os.path.isfile(include) else None
 
-    candidates: List[str] = []
     for base in [item_base, tid_base, cli_base, os.getcwd()]:
         if base:
-            candidates.append(os.path.join(base, include))
-    resolved = _first_existing(candidates)
-    if not resolved:
-        debug_print(f"Include not found: '{include}' (tried: {candidates})")
-    return resolved
+            c = os.path.join(base, include)
+            if os.path.isfile(c):
+                return os.path.abspath(c)
 
-def collect_included_patterns(includes_field,
-                              item_base: Optional[str],
-                              tid_base: Optional[str],
-                              cli_base: Optional[str]) -> List[str]:
-    """Collect patterns from 'includes' (str or list[str]) using base-dir precedence."""
-    result: List[str] = []
+    debug_print(f"Include not found: {include}")
+    return None
+
+def collect_included_patterns(includes_field, item_base, tid_base, cli_base):
+    out: List[str] = []
     for inc in norm_list(includes_field):
         if not isinstance(inc, str):
-            debug_print(f"Skip non-string include: {inc!r}")
             continue
         p = resolve_include_path(inc, item_base, tid_base, cli_base)
         if not p:
-            debug_print(f"Skip missing include: {inc!r}")
             continue
         try:
             pats = load_patterns_from_file(p)
             debug_print(f"Loaded {len(pats)} patterns from include '{p}'")
-            result.extend(pats)
-        except OSError as e:
-            debug_print(f"Error reading include '{p}': {e}")
-    return result
+            out.extend(pats)
+        except Exception as e:
+            debug_print(f"Failed to load include '{p}': {e}")
+    return out
 
-# ---------- pattern classification ----------
-_WILD_ANY_LABEL = r"[^.]*"  # one DNS label
+# ---------- classify patterns ----------
+_WILD_ANY_LABEL = r"[^.]*"
 
-def classify_pattern(p: Optional[str]) -> Optional[Tuple[str, str]]:
-    """
-    Return ('suffix'|'regex', value) or None.
-      - '*.example.com' / '.example.com' -> ('suffix', 'example.com')
-      - 'rutracker.*'                    -> ('regex', '^(.+\\.)?rutracker\\.[^.]+$')
-      - '*' anywhere in the string       -> ('regex', '^...$') with [^.]* for '*'
-      - plain domain/label               -> ('suffix', value)
-    """
-    if p is None:
-        return None
-    p = p.strip()
+def classify_pattern(p: Optional[str]):
     if not p:
         return None
-    p = p.lower()
+    p = p.strip().lower()
+    if not p:
+        return None
 
     if p.startswith("*.") and len(p) > 2:
         return ("suffix", p[2:])
     if p.startswith(".") and len(p) > 1:
         return ("suffix", p[1:])
     if p.endswith(".*") and not p.startswith("*"):
-        base = p[:-2]
-        if base:
-            rx = rf"^(.+\.)?{re.escape(base)}\.[^.]+$"
+        b = p[:-2]
+        if b:
+            rx = rf"^(.+\.)?{re.escape(b)}\.[^.]+$"
             return ("regex", rx)
+
     if "*" in p:
         rx = re.escape(p).replace(r"\*", _WILD_ANY_LABEL)
         return ("regex", rf"^{rx}$")
+
     return ("suffix", p)
 
-# ---------- rule builder ----------
-def generate_rules(inbound: str, patterns, outbound: str) -> List[Dict[str, Any]]:
-    """Build a single rule object while preserving input order; de-dup first occurrence."""
+# ---------- rules ----------
+def generate_rules(inbound: str, patterns, outbound: str, xray_mode: bool):
     suf: List[str] = []
     reg: List[str] = []
-    seen_suf, seen_reg = set(), set()
+    ss, sr = set(), set()
 
     for raw in norm_list(patterns):
         c = classify_pattern(raw)
@@ -172,21 +131,39 @@ def generate_rules(inbound: str, patterns, outbound: str) -> List[Dict[str, Any]
         kind, val = c
         if kind == "suffix":
             val = val.lstrip(".")
-            if val not in seen_suf:
-                seen_suf.add(val); suf.append(val)
-        elif kind == "regex":
-            if val not in seen_reg:
-                seen_reg.add(val); reg.append(val)
+            if val not in ss:
+                ss.add(val)
+                suf.append(val)
+        else:
+            if val not in sr:
+                sr.add(val)
+                reg.append(val)
 
-    if not (suf or reg):
+    if not suf and not reg:
         return []
 
-    rule: Dict[str, Any] = {"inbound": inbound, "outbound": outbound}
-    if suf: rule["domain_suffix"] = suf
-    if reg: rule["domain_regex"] = reg
-    return [rule]
+    if xray_mode:
+        # Xray / V2Ray style
+        r: Dict[str, Any] = {
+            "type": "field",
+            "inboundTag": [inbound],
+            "outboundTag": outbound,
+        }
+        if suf:
+            r["domainSuffix"] = suf
+        if reg:
+            r["domainRegex"] = reg
+    else:
+        # sing-box style
+        r = {"inbound": inbound, "outbound": outbound}
+        if suf:
+            r["domain_suffix"] = suf
+        if reg:
+            r["domain_regex"] = reg
 
-# ---------- trailing commas sanitizer ----------
+    return [r]
+
+# ---------- sanitize trailing commas ----------
 def _sanitize_trailing_commas(s: str) -> str:
     s = re.sub(r',\s*([\]}])', r'\1', s)
     s = re.sub(r'([\[{])\s*,', r'\1', s)
@@ -195,305 +172,297 @@ def _sanitize_trailing_commas(s: str) -> str:
     s = re.sub(r'\{\s*,\s*\}', '{}', s)
     return s
 
-# ---------- placeholder helpers ----------
+# ---------- placeholders ----------
 _PLACEH_RX = r'%%([^%:\s]+):([^%]+)%%'
-_FINAL_TOKEN = '%%FINAL%%'
+_FINAL_TOKEN = "%%FINAL%%"
 
 def _quote_unquoted_placeholders(text: str) -> str:
     text = re.sub(r'(?<!")(' + _PLACEH_RX + r')(?!")', r'"\1"', text)
     text = re.sub(r'(?<!")(' + re.escape(_FINAL_TOKEN) + r')(?!")', r'"\1"', text)
     return text
 
-def _find_placeholders_in_ast(node: Any) -> List[str]:
-    found: List[str] = []
+def _find_placeholders(node):
+    f = []
     if isinstance(node, str):
         if re.fullmatch(_PLACEH_RX, node) or node == _FINAL_TOKEN:
-            found.append(node)
+            f.append(node)
     elif isinstance(node, list):
-        for item in node:
-            found += _find_placeholders_in_ast(item)
+        for i in node:
+            f += _find_placeholders(i)
     elif isinstance(node, dict):
         for v in node.values():
-            found += _find_placeholders_in_ast(v)
-    return found
+            f += _find_placeholders(v)
+    return f
 
-# ---------- outbound tags ----------
-def collect_available_out_tags_from_ast(tpl_json: Dict[str, Any]) -> List[str]:
-    tags: List[str] = []
+# ---------- outbounds detection ----------
+def collect_available_out_tags(tpl_json, xray_mode: bool):
+    tags = []
     seen = set()
-    for ob in (tpl_json.get("outbounds") or []):
+
+    # Currently outbounds syntax is the same, just collect .tag
+    arr = tpl_json.get("outbounds") or []
+    for ob in arr:
         if isinstance(ob, dict):
             tag = ob.get("tag")
-            if isinstance(tag, str) and tag and tag not in seen:
-                seen.add(tag); tags.append(tag)
+            if isinstance(tag, str) and tag not in seen:
+                seen.add(tag)
+                tags.append(tag)
     return tags
 
-# ---------- FINAL selection ----------
-def pick_final_value(config: Dict[str, Any],
-                     chosen_tid: Optional[str],
-                     available_out_tags: Set[str]) -> str:
-    if not chosen_tid or chosen_tid not in config:
+# ---------- pick FINAL ----------
+def pick_final(config, tid: Optional[str], available: Set[str]):
+    if not tid or tid not in config:
         return "direct"
-    cfg = config[chosen_tid]
+    cfg = config[tid]
     if cfg.get("default_direct", True):
         return "direct"
+
     for lst in cfg.get("lists", []):
-        if not isinstance(lst, dict):
-            continue
-        outs = norm_list(lst.get('out'))
-        for out in outs:
-            if not isinstance(out, str):
-                continue
-            if available_out_tags and out not in available_out_tags:
-                continue
-            return out
+        outs = norm_list(lst.get("out"))
+        for o in outs:
+            if o in available:
+                return o
+
     return "direct"
 
 # ---------- AST replacement ----------
-def ast_replace(node: Any,
-                rules_by_placeholder: Dict[str, List[Dict[str, Any]]],
-                final_value: Optional[str]) -> Any:
+def ast_replace(node, rules_by_token, final_value):
     if isinstance(node, list):
-        out: List[Any] = []
-        for item in node:
-            if isinstance(item, str) and item in rules_by_placeholder:
-                out.extend(rules_by_placeholder[item])
+        out = []
+        for i in node:
+            if isinstance(i, str) and i in rules_by_token:
+                out.extend(rules_by_token[i])
             else:
-                out.append(ast_replace(item, rules_by_placeholder, final_value))
+                out.append(ast_replace(i, rules_by_token, final_value))
         return out
+
     if isinstance(node, dict):
-        return {k: ast_replace(v, rules_by_placeholder, final_value) for k, v in node.items()}
+        return {k: ast_replace(v, rules_by_token, final_value) for k,v in node.items()}
+
     if isinstance(node, str):
         if node == _FINAL_TOKEN and final_value is not None:
             return final_value
         return node
+
     return node
 
-# ---------- expanders for direct/blocked ----------
-def expand_pattern_source(source_item, item_base: Optional[str], tid_base: Optional[str], cli_base: Optional[str]) -> List[str]:
-    """
-    Expand a 'pattern source' which can be:
-      - string: returns [string]
-      - dict: may contain 'includes' and/or 'patterns' (string or list)
-    """
-    if isinstance(source_item, str):
-        return [source_item]
-    if isinstance(source_item, dict):
-        pats: List[str] = []
-        pats.extend(collect_included_patterns(source_item.get("includes"), item_base, tid_base, cli_base))
-        pats.extend(norm_list(source_item.get("patterns")))
-        return pats
-    return []
-
-def collect_direct_or_blocked_patterns(sources: Any,
-                                       base_dirs: List[Optional[str]],
-                                       tid_base: Optional[str],
-                                       cli_base: Optional[str]) -> List[str]:
-    """
-    Collect patterns for 'direct' or 'blocked'.
-    'sources' may be list/dict/string. 'base_dirs' mirrors append order (per YAML file),
-    holding per-item base dir hints. We also check tid_base and cli_base as fallbacks.
-    """
-    results: List[str] = []
-    items = sources if isinstance(sources, list) else [sources] if sources is not None else []
-    for idx, it in enumerate(items):
-        item_base = None
-        if isinstance(it, dict) and "__base_dir" in it:
-            item_base = it["__base_dir"]
-            it = {k: v for k, v in it.items() if k != "__base_dir"}  # strip helper key
-        elif idx < len(base_dirs):
-            item_base = base_dirs[idx]
-        results.extend(expand_pattern_source(it, item_base, tid_base, cli_base))
-    return results
-
+# ---------- main ----------
 def main():
     global DEBUG
 
-    parser = argparse.ArgumentParser(description="Generate sing-box JSON from template + YAML config(s).")
-    parser.add_argument("template", help="Path to JSON template with placeholders like %%tid:inbound%% (quoted or bare)")
-    parser.add_argument("yamls", nargs="+", help="One or more YAML files with rules")
-    parser.add_argument("--base-dir", dest="cli_base_dir", default=None,
-                        help="Optional base directory for resolving relative 'includes' (used after item/tid base dirs)")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging to stderr")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Generate sing-box/xray JSON from template + YAML config(s).")
+    ap.add_argument("template", help="Path to JSON template with placeholders like %%tid:inbound%% (quoted or bare)")
+    ap.add_argument("yamls", nargs="+", help="One or more YAML files with rules")
+    ap.add_argument("-v","--verbose", action="store_true", help="Enable debug logging to stderr")
+    ap.add_argument("-b","--base-dir", dest="cli_base_dir", default=None,
+                    help="Optional base directory for resolving relative 'includes' (used after item/tid base dirs)")
+    ap.add_argument("-a","--append", dest="append_rule",
+                    help="Append raw fragment (string or JSON) into route/routing.rules[] before placeholder processing")
+    ap.add_argument("-x","--xray", action="store_true", help="Xray mode")
+    args = ap.parse_args()
 
-    DEBUG = args.debug
+    DEBUG = args.verbose
 
-    # --- file existence checks ---
+    if DEBUG:
+        debug_print(f"Template: {args.template}")
+        debug_print(f"YAML files: {args.yamls}")
+        debug_print(f"CLI base_dir: {args.cli_base_dir or '(none)'}")
+        debug_print(f"Mode: {'xray' if args.xray else 'sing-box'}")
+
+    # load template
     if not os.path.isfile(args.template):
-        print(f"Error: template file '{args.template}' not found.", file=sys.stderr)
-        sys.exit(1)
-    for path in args.yamls:
-        if not os.path.isfile(path):
-            print(f"Error: YAML file '{path}' not found.", file=sys.stderr)
-            sys.exit(1)
+        print("Template not found", file=sys.stderr); sys.exit(1)
 
-    debug_print(f"Template: {args.template}")
-    debug_print(f"YAML files: {args.yamls}")
-    debug_print(f"CLI base_dir: {args.cli_base_dir or '(none)'}")
-
-    # --- read and prepare template text ---
-    with open(args.template, "r", encoding="utf-8") as f:
-        tpl_text = f.read()
-    tpl_text = _sanitize_trailing_commas(tpl_text)
-    tpl_text = _quote_unquoted_placeholders(tpl_text)
+    txt = open(args.template,"r",encoding="utf-8").read()
+    txt = _sanitize_trailing_commas(txt)
+    txt = _quote_unquoted_placeholders(txt)
 
     try:
-        tpl_json: Any = json.loads(tpl_text)
+        tpl_json = json.loads(txt)
     except json.JSONDecodeError as e:
-        lines = tpl_text.splitlines()
-        ln = e.lineno or 1
-        start = max(1, ln - 15)
-        end = min(len(lines), ln + 15)
-        sys.stderr.write(f"Template JSON error at line {e.lineno}, column {e.colno}: {e.msg}\n")
-        for i in range(start, end + 1):
-            prefix = ">> " if i == ln else "   "
-            sys.stderr.write(f"{prefix}{i:5d}: {lines[i-1]}\n")
+        print(f"JSON error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    available_out_tags_list = collect_available_out_tags_from_ast(tpl_json)
-    available_out_tags: Set[str] = set(available_out_tags_list)
-    debug_print(f"Available outbound tags: {available_out_tags_list}")
+    # -------- append raw fragment into template BEFORE placeholder processing --------
+    if args.append_rule:
+        section = "routing" if args.xray else "route"
+        if section not in tpl_json or "rules" not in tpl_json[section] or not isinstance(tpl_json[section]["rules"], list):
+            print(f"Cannot append: section '{section}.rules' not found or not a list", file=sys.stderr)
+        else:
+            rules_list = tpl_json[section]["rules"]
+            raw = args.append_rule
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                # treat as raw string (e.g. '%%russia:in-extra%%')
+                rules_list.append(raw)
+                debug_print(f"Appended raw string from -a into {section}.rules: {raw}")
+            else:
+                if isinstance(parsed, list):
+                    rules_list.extend(parsed)
+                    debug_print(f"Appended {len(parsed)} JSON rule(s) from -a into {section}.rules")
+                else:
+                    rules_list.append(parsed)
+                    debug_print(f"Appended 1 JSON rule from -a into {section}.rules")
 
-    # --- aggregate YAML configs (preserve order; store per-item base_dir and per-tid base_dir) ---
+    available_tags_list = collect_available_out_tags(tpl_json, args.xray)
+    available_tags = set(available_tags_list)
+
+    debug_print(f"Available outbound tags: {available_tags_list}")
+
+    # -------- YAML merge --------
     config: Dict[str, Dict[str, Any]] = {}
-    tid_base_dir: Dict[str, Optional[str]] = {}  # per tid base_dir from YAML
-    direct_item_bases: Dict[str, List[Optional[str]]] = {}
-    blocked_item_bases: Dict[str, List[Optional[str]]] = {}
+    tid_base: Dict[str, Optional[str]] = {}
+    direct_bases: Dict[str, List[str]] = {}
+    block_bases: Dict[str, List[str]] = {}
 
     for path in args.yamls:
-        with open(path, 'r', encoding='utf-8') as f:
-            data = yaml.safe_load(f) or {}
-        file_base = os.path.dirname(os.path.abspath(path))
-        debug_print(f"Loaded YAML: {path} (file_base={file_base})")
+        data = yaml.safe_load(open(path,"r",encoding="utf-8")) or {}
+        base = os.path.dirname(os.path.abspath(path))
 
-        for tid, section in (data or {}).items():
+        debug_print(f"Loaded YAML: {os.path.basename(path)} (file_base={base})")
+
+        for tid, sec in data.items():
             if tid not in config:
-                config[tid] = {"lists": [], "direct": [], "blocked": [], "default_direct": True}
-                direct_item_bases[tid] = []
-                blocked_item_bases[tid] = []
-                tid_base_dir[tid] = None
+                config[tid] = {"lists":[], "direct":[], "blocked":[], "default_direct":True}
+                tid_base[tid] = None
+                direct_bases[tid] = []
+                block_bases[tid] = []
                 debug_print(f"New tid: {tid}")
+
             cfg = config[tid]
 
-            # per-profile base_dir (optional)
-            if isinstance(section, dict) and "base_dir" in section and section["base_dir"]:
-                # if relative, resolve against YAML file location
-                b = section["base_dir"]
-                tid_base_dir[tid] = b if os.path.isabs(b) else os.path.abspath(os.path.join(file_base, b))
-                debug_print(f"{tid}: base_dir set to {tid_base_dir[tid]}")
+            if isinstance(sec, dict) and "base_dir" in sec and sec["base_dir"]:
+                b = sec["base_dir"]
+                tid_base[tid] = b if os.path.isabs(b) else os.path.abspath(os.path.join(base,b))
+                debug_print(f"{tid}: base_dir set to {tid_base[tid]}")
 
-            # lists: stamp per-item YAML file base for includes
-            for lst in section.get("lists") or []:
+            # lists
+            for lst in sec.get("lists") or []:
                 if isinstance(lst, dict):
-                    lst = dict(lst)
-                    lst["__base_dir"] = file_base
-                cfg["lists"].append(lst)
+                    obj = dict(lst)
+                    obj["__base_dir"] = base
+                    cfg["lists"].append(obj)
 
             # direct
-            direct_src = section.get("direct")
-            if isinstance(direct_src, list):
-                for item in direct_src:
-                    if isinstance(item, dict):
-                        it = dict(item); it["__base_dir"] = file_base
+            dsrc = sec.get("direct")
+            if isinstance(dsrc, list):
+                for it in dsrc:
+                    if isinstance(it, dict):
+                        o = dict(it); o["__base_dir"] = base; cfg["direct"].append(o)
+                    else:
                         cfg["direct"].append(it)
-                    else:
-                        cfg["direct"].append(item)
-                    direct_item_bases[tid].append(file_base)
-            elif direct_src is not None:
-                if isinstance(direct_src, dict):
-                    it = dict(direct_src); it["__base_dir"] = file_base
-                    cfg["direct"].append(it)
+                    direct_bases[tid].append(base)
+            elif dsrc is not None:
+                if isinstance(dsrc, dict):
+                    o = dict(dsrc); o["__base_dir"] = base; cfg["direct"].append(o)
                 else:
-                    cfg["direct"].append(direct_src)
-                direct_item_bases[tid].append(file_base)
+                    cfg["direct"].append(dsrc)
+                direct_bases[tid].append(base)
 
-            # blocked
-            blocked_src = section.get("blocked")
-            if isinstance(blocked_src, list):
-                for item in blocked_src:
-                    if isinstance(item, dict):
-                        it = dict(item); it["__base_dir"] = file_base
+            # blocked / block
+            bsrc = sec.get("blocked") or sec.get("block")
+            if isinstance(bsrc, list):
+                for it in bsrc:
+                    if isinstance(it, dict):
+                        o = dict(it); o["__base_dir"] = base; cfg["blocked"].append(o)
+                    else:
                         cfg["blocked"].append(it)
-                    else:
-                        cfg["blocked"].append(item)
-                    blocked_item_bases[tid].append(file_base)
-            elif blocked_src is not None:
-                if isinstance(blocked_src, dict):
-                    it = dict(blocked_src); it["__base_dir"] = file_base
-                    cfg["blocked"].append(it)
+                    block_bases[tid].append(base)
+            elif bsrc is not None:
+                if isinstance(bsrc, dict):
+                    o = dict(bsrc); o["__base_dir"] = base; cfg["blocked"].append(o)
                 else:
-                    cfg["blocked"].append(blocked_src)
-                blocked_item_bases[tid].append(file_base)
+                    cfg["blocked"].append(bsrc)
+                block_bases[tid].append(base)
 
-            cfg["default_direct"] = norm_bool(section.get("default_direct"), default=cfg["default_direct"])
-            debug_print(f"{tid}: lists={len(cfg['lists'])} direct={len(cfg['direct'])} blocked={len(cfg['blocked'])} default_direct={cfg['default_direct']}")
+            cfg["default_direct"] = norm_bool(sec.get("default_direct"), default=cfg["default_direct"])
 
-    # --- placeholders in AST order ---
-    present_placeholders = _find_placeholders_in_ast(tpl_json)
-    debug_print(f"Placeholders in AST (order): {present_placeholders}")
+            debug_print(
+                f"{tid}: lists={len(cfg['lists'])} direct={len(cfg['direct'])} "
+                f"blocked={len(cfg['blocked'])} default_direct={cfg['default_direct']}"
+            )
 
-    # --- build rules per placeholder ---
-    rules_by_placeholder: Dict[str, List[Dict[str, Any]]] = {}
-    for token in present_placeholders:
-        m = re.fullmatch(_PLACEH_RX, token)
+    # -------- find placeholders --------
+    placeholders = _find_placeholders(tpl_json)
+    debug_print(f"Placeholders in AST (order): {placeholders}")
+
+    # -------- build rules --------
+    rules_by_ph: Dict[str, List[Dict[str, Any]]] = {}
+
+    for tok in placeholders:
+        m = re.fullmatch(_PLACEH_RX, tok)
         if not m:
             continue
         tid, inbound = m.group(1), m.group(2)
+
         if tid not in config:
-            debug_print(f"tid '{tid}' not found in YAML; placeholder will be removed")
-            rules_by_placeholder[token] = []
+            rules_by_ph[tok] = []
             continue
 
-        data = config[tid]
+        sec = config[tid]
         rules: List[Dict[str, Any]] = []
 
-        # lists (in YAML order)
-        for lst in data.get('lists', []):
-            if not isinstance(lst, dict):
-                continue
-            item_base = lst.get("__base_dir") or None
-            # compose patterns: includes first, then inline patterns
-            patterns: List[str] = []
-            patterns += collect_included_patterns(lst.get('includes'),
-                                                 item_base=item_base,
-                                                 tid_base=tid_base_dir.get(tid),
-                                                 cli_base=args.cli_base_dir)
-            patterns += norm_list(lst.get('patterns'))
+        # lists
+        for lst in sec["lists"]:
+            item_base = lst.get("__base_dir")
+            pats: List[str] = []
+            pats += collect_included_patterns(lst.get("includes"), item_base, tid_base.get(tid), args.cli_base_dir)
+            pats += norm_list(lst.get("patterns"))
+            outs = norm_list(lst.get("out"))
+            for o in outs:
+                if o in available_tags:
+                    rules.extend(generate_rules(inbound, pats, o, args.xray))
+                else:
+                    debug_print(f"Skip list out='{o}' (not present in template outbounds)")
 
-            outs = norm_list(lst.get('out'))
-            if not outs:
-                continue
-            for out in outs:
-                if not isinstance(out, str):
-                    continue
-                if available_out_tags and out not in available_out_tags:
-                    debug_print(f"Skip list out='{out}' (not present in template outbounds)")
-                    continue
-                rules.extend(generate_rules(inbound, patterns, out))
+        # direct
+        dp: List[str] = []
+        src = sec["direct"]
+        bases = direct_bases[tid]
+        if isinstance(src, list):
+            for it, ib in zip(src, bases):
+                item = it
+                if isinstance(item, dict):
+                    ib = item.get("__base_dir", ib)
+                    dp += collect_included_patterns(item.get("includes"),
+                                                   ib, tid_base.get(tid), args.cli_base_dir)
+                    dp += norm_list(item.get("patterns"))
+                else:
+                    dp.append(item)
 
-        # direct / blocked with includes support
-        d_patterns = collect_direct_or_blocked_patterns(
-            data.get('direct'), direct_item_bases.get(tid, []), tid_base_dir.get(tid), args.cli_base_dir
-        )
-        b_patterns = collect_direct_or_blocked_patterns(
-            data.get('blocked'), blocked_item_bases.get(tid, []), tid_base_dir.get(tid), args.cli_base_dir
-        )
-        rules.extend(generate_rules(inbound, d_patterns, "direct"))
-        rules.extend(generate_rules(inbound, b_patterns, "block"))
+        # blocked
+        bp: List[str] = []
+        src = sec["blocked"]
+        bases = block_bases[tid]
+        if isinstance(src, list):
+            for it, ib in zip(src, bases):
+                item = it
+                if isinstance(item, dict):
+                    ib = item.get("__base_dir", ib)
+                    bp += collect_included_patterns(item.get("includes"),
+                                                   ib, tid_base.get(tid), args.cli_base_dir)
+                    bp += norm_list(item.get("patterns"))
+                else:
+                    bp.append(item)
 
-        rules_by_placeholder[token] = rules
+        rules.extend(generate_rules(inbound, dp, "direct", args.xray))
+        rules.extend(generate_rules(inbound, bp, "block", args.xray))
 
-    # --- %%FINAL%% ---
+        rules_by_ph[tok] = rules
+
+    # -------- FINAL --------
     final_value = None
-    if _FINAL_TOKEN in present_placeholders:
-        chosen_final_tid: Optional[str] = next((tid for tid in config.keys() if 'default_direct' in config[tid]), None)
-        final_value = pick_final_value(config, chosen_final_tid, available_out_tags)
-        debug_print(f"FINAL picked: {final_value} from tid={chosen_final_tid}")
+    if _FINAL_TOKEN in placeholders:
+        first_tid = next(iter(config.keys()), None)
+        final_value = pick_final(config, first_tid, available_tags)
+        debug_print(f"FINAL picked: {final_value} from tid={first_tid}")
 
-    # --- apply ---
-    result_ast = ast_replace(tpl_json, rules_by_placeholder, final_value)
-    print(json.dumps(result_ast, indent=2, ensure_ascii=False))
+    # -------- apply AST replace --------
+    out_ast = ast_replace(tpl_json, rules_by_ph, final_value)
+
+    print(json.dumps(out_ast, indent=2, ensure_ascii=False))
 
 if __name__ == "__main__":
     main()
+
