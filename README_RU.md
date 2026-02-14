@@ -28,6 +28,8 @@ sbgen <template.tpl> <config.yml> [more.yml...] [опции]
 **Опции:**
 - `-v, --verbose` — Включить отладочный вывод в stderr
 - `-b, --base-dir DIR` — Базовая директория для разрешения относительных путей `includes` (используется после базовых директорий item/tid)
+- `-c, --cache-dir DIR` — Директория кэша для загружаемых по URL списков (по умолчанию: `~/.cache/sbgen`)
+- `-r, --refresh` — Принудительно перезагружать списки по URL (при ошибке используется старый кэш)
 - `-a, --append RULE` — Добавить сырой фрагмент (строка или JSON) в `route.rules[]` или `routing.rules[]` перед обработкой плейсхолдеров
 - `-x, --xray` — Генерировать конфигурацию в стиле Xray/V2Ray вместо sing-box
 
@@ -72,6 +74,7 @@ russia:
         - "linkedin.com"
       includes:
         - "world.list"
+      urls: [ "https://core.telegram.org/resources/cidr.txt" ]
   direct:
     - "myserver.local"
     - includes: ["direct.list"]
@@ -103,6 +106,7 @@ russia:
 | `out` | `string` или `list<string>` | Один или несколько `outbound`, куда направлять трафик. |
 | `patterns` | `list<string>` | Список шаблонов доменов и/или CIDR (IPv4/IPv6 с префиксом). |
 | `includes` | `list<string>` | Пути к внешним файлам (по одному домену на строку, `#` — комментарий). |
+| `urls` | `list<string>` | URL'ы списков в том же формате, что и `includes`; загружаются по HTTP(S) с кэшем (по умолчанию `~/.cache/sbgen`; `-c`/`--cache-dir`, `-r`/`--refresh`; при ошибке загрузки используется старый кэш). |
 
 ---
 
@@ -131,9 +135,9 @@ russia:
 
 ---
 
-## 📂 Формат файлов `includes`
+## 📂 Формат файлов `includes` и контента по `urls`
 
-Пример `world.list`:
+Содержимое файлов `includes` и загружаемых по полю `urls` списков имеет один и тот же формат. Пример `world.list`:
 
 ```text
 # streaming
@@ -370,6 +374,7 @@ myprofile:
     - name: world
       out: [ proxy ]
       includes: [ world.list ]
+      urls: [ "https://core.telegram.org/resources/cidr.txt" ]
       patterns:
         - "google.com"
         - "youtube.com"

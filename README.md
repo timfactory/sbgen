@@ -28,6 +28,8 @@ sbgen <template.tpl> <config.yml> [more.yml...] [options]
 **Options:**
 - `-v, --verbose` — Enable debug logging to stderr
 - `-b, --base-dir DIR` — Base directory for resolving relative `includes` paths (used after item/tid base dirs)
+- `-c, --cache-dir DIR` — Cache directory for URL-fetched lists (default: `~/.cache/sbgen`)
+- `-r, --refresh` — Force re-download of URL lists (on failure, existing cache is used)
 - `-a, --append RULE` — Append raw fragment (string or JSON) into `route.rules[]` or `routing.rules[]` before placeholder processing
 - `-x, --xray` — Generate Xray/V2Ray style configuration instead of sing-box
 
@@ -72,6 +74,7 @@ russia:
         - "linkedin.com"
       includes:
         - "world.list"
+      urls: [ "https://core.telegram.org/resources/cidr.txt" ]
   direct:
     - "myserver.local"
     - includes: ["direct.list"]
@@ -103,6 +106,7 @@ Each `lists` item may contain:
 | `out` | `string or list<string>` | One or more outbounds to route traffic to. |
 | `patterns` | `list<string>` | Inline domain patterns and/or CIDR entries (IPv4/IPv6 with prefix). |
 | `includes` | `list<string>` | Paths to external lists (one domain per line, `#` for comments). |
+| `urls` | `list<string>` | URLs of lists in the same format as `includes`; fetched over HTTP(S) with caching (default: `~/.cache/sbgen`; `-c`/`--cache-dir`, `-r`/`--refresh`; on fetch error the existing cache is used). |
 
 ---
 
@@ -131,9 +135,9 @@ In Xray mode (`-x`), CIDR uses the `ip` field instead of `ip_cidr`.
 
 ---
 
-## 📂 `includes` File Format
+## 📂 `includes` and `urls` content format
 
-Example `world.list`:
+Files from `includes` and content fetched from `urls` share the same format. Example `world.list`:
 
 ```text
 # streaming
@@ -370,6 +374,7 @@ myprofile:
     - name: world
       out: [ proxy ]
       includes: [ world.list ]
+      urls: [ "https://core.telegram.org/resources/cidr.txt" ]
       patterns:
         - "google.com"
         - "youtube.com"
