@@ -9,11 +9,12 @@
 
 import sys
 import os
+import ipaddress
 import yaml
 import json
 import re
 import argparse
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 DEBUG = False
 
@@ -98,10 +99,17 @@ _WILD_ANY_LABEL = r"[^.]*"
 def classify_pattern(p: Optional[str]):
     if not p:
         return None
-    p = p.strip().lower()
+    p = p.strip()
     if not p:
         return None
 
+    try:
+        network = ipaddress.ip_network(p, strict=False)
+        return ("cidr", str(network))
+    except ValueError:
+        pass
+
+    p = p.lower()
     if p.startswith("*.") and len(p) > 2:
         return ("suffix", p[2:])
     if p.startswith(".") and len(p) > 1:
@@ -118,6 +126,25 @@ def classify_pattern(p: Optional[str]):
 
     return ("suffix", p)
 
+def split_patterns(patterns) -> Tuple[List[str], List[str]]:
+    domain_list: List[str] = []
+    cidr_list: List[str] = []
+    cidr_seen: Set[str] = set()
+    for raw in norm_list(patterns):
+        if not isinstance(raw, str):
+            continue
+        c = classify_pattern(raw)
+        if not c:
+            continue
+        kind, val = c
+        if kind == "cidr":
+            if val not in cidr_seen:
+                cidr_seen.add(val)
+                cidr_list.append(val)
+        else:
+            domain_list.append(raw)
+    return (domain_list, cidr_list)
+
 # ---------- rules ----------
 def generate_rules(inbound: str, patterns, outbound: str, xray_mode: bool):
     suf: List[str] = []
@@ -129,6 +156,8 @@ def generate_rules(inbound: str, patterns, outbound: str, xray_mode: bool):
         if not c:
             continue
         kind, val = c
+        if kind == "cidr":
+            continue
         if kind == "suffix":
             val = val.lstrip(".")
             if val not in ss:
@@ -162,6 +191,22 @@ def generate_rules(inbound: str, patterns, outbound: str, xray_mode: bool):
             r["domain_regex"] = reg
 
     return [r]
+
+def generate_cidr_rules(inbound: str, cidr_list: List[str], outbound: str, xray_mode: bool) -> List[Dict[str, Any]]:
+    if not cidr_list:
+        return []
+    if xray_mode:
+        return [{
+            "type": "field",
+            "inboundTag": [inbound],
+            "outboundTag": outbound,
+            "ip": list(cidr_list),
+        }]
+    return [{
+        "inbound": inbound,
+        "outbound": outbound,
+        "ip_cidr": list(cidr_list),
+    }]
 
 # ---------- sanitize trailing commas ----------
 def _sanitize_trailing_commas(s: str) -> str:
@@ -409,10 +454,12 @@ def main():
             pats: List[str] = []
             pats += collect_included_patterns(lst.get("includes"), item_base, tid_base.get(tid), args.cli_base_dir)
             pats += norm_list(lst.get("patterns"))
+            domain_pats, cidr_pats = split_patterns(pats)
             outs = norm_list(lst.get("out"))
             for o in outs:
                 if o in available_tags:
-                    rules.extend(generate_rules(inbound, pats, o, args.xray))
+                    rules.extend(generate_rules(inbound, domain_pats, o, args.xray))
+                    rules.extend(generate_cidr_rules(inbound, cidr_pats, o, args.xray))
                 else:
                     debug_print(f"Skip list out='{o}' (not present in template outbounds)")
 
@@ -446,8 +493,12 @@ def main():
                 else:
                     bp.append(item)
 
-        rules.extend(generate_rules(inbound, dp, "direct", args.xray))
-        rules.extend(generate_rules(inbound, bp, "block", args.xray))
+        domain_dp, cidr_dp = split_patterns(dp)
+        domain_bp, cidr_bp = split_patterns(bp)
+        rules.extend(generate_rules(inbound, domain_dp, "direct", args.xray))
+        rules.extend(generate_cidr_rules(inbound, cidr_dp, "direct", args.xray))
+        rules.extend(generate_rules(inbound, domain_bp, "block", args.xray))
+        rules.extend(generate_cidr_rules(inbound, cidr_bp, "block", args.xray))
 
         rules_by_ph[tok] = rules
 

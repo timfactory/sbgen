@@ -1,0 +1,6 @@
+.cursor
+.vscode
+*.yml
+*.list
+*.tpl
+*.json

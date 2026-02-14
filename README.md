@@ -88,8 +88,8 @@ russia:
 | `base_dir` | `string` | Optional. Base directory for relative `includes` paths. |
 | `default_direct` | `bool` | If `true`, `%%FINAL%%` becomes `direct`. If `false`, uses first available `out` from `lists`. Default: `true`. |
 | `lists` | `list<object>` | A set of routing domain groups with specific outbounds. |
-| `direct` | `list<mixed>` | Directly routed domains (`outbound = direct`). |
-| `blocked` / `block` | `list<mixed>` | Blocked domains (`outbound = block`). Both keys are supported. |
+| `direct` | `list<mixed>` | Directly routed domains and/or CIDR (`outbound = direct`). |
+| `blocked` / `block` | `list<mixed>` | Blocked domains and/or CIDR (`outbound = block`). Both keys are supported. |
 
 ---
 
@@ -101,7 +101,7 @@ Each `lists` item may contain:
 |--------|------|-------------|
 | `name` | `string` | Optional descriptive name. |
 | `out` | `string or list<string>` | One or more outbounds to route traffic to. |
-| `patterns` | `list<string>` | Inline domain patterns. |
+| `patterns` | `list<string>` | Inline domain patterns and/or CIDR entries (IPv4/IPv6 with prefix). |
 | `includes` | `list<string>` | Paths to external lists (one domain per line, `#` for comments). |
 
 ---
@@ -118,7 +118,16 @@ Each `lists` item may contain:
 | `*cdn.com` | `domain_regex` | `"domain_regex": ["^[^.]*cdn\\.com$"]` |
 | `localhost` | `domain_suffix` | `"domain_suffix": ["localhost"]` |
 
-**Note:** In Xray mode (`-x`), these become `domainSuffix` and `domainRegex` instead.
+**CIDR.** Lines in CIDR format (IPv4 or IPv6 with prefix) are recognized and emitted in **separate** rules:
+
+| Example | Interpreted As | Generated Rule |
+|----------|----------------|----------------|
+| `192.168.0.0/16` | IP (CIDR) rule | `"ip_cidr": ["192.168.0.0/16"]` |
+| `10.0.0.0/8`, `fd00::/8` | IP (CIDR) rule | `"ip_cidr": ["10.0.0.0/8", "fd00::/8"]` |
+
+In Xray mode (`-x`), CIDR uses the `ip` field instead of `ip_cidr`.
+
+**Note:** In Xray mode (`-x`), domain fields become `domainSuffix` and `domainRegex` instead.
 
 ---
 
@@ -137,7 +146,7 @@ twitter.com
 facebook.com
 ```
 
-- Each line defines a domain or pattern.  
+- Each line defines a domain or pattern. A line can also be a CIDR (e.g. `192.168.0.0/16`, `fd00::/8`); such entries are emitted as rules with `ip_cidr` (sing-box) or `ip` (Xray).  
 - `#` starts a comment (full line or inline with `\#` to escape).  
 - Empty lines are ignored.  
 - Inline comments are supported: `example.com # comment`  
@@ -159,7 +168,7 @@ facebook.com
 6. For each placeholder:
    - Loads patterns from `lists`, `direct`, and `blocked` sections
    - Resolves `includes` files (relative to `base_dir`, item base, or CLI `-b`)
-   - Classifies patterns as `domain_suffix` or `domain_regex`
+   - Splits patterns into domain (`domain_suffix`/`domain_regex`) and CIDR; CIDR entries produce separate rules with `ip_cidr` (or `ip` in Xray)
    - Generates routing rules for the specified inbound
 7. Replaces placeholders with generated rule arrays.  
 8. Computes `%%FINAL%%` based on `default_direct` and available outbounds.  
