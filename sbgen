@@ -256,7 +256,10 @@ def generate_rules(inbound: str, patterns, outbound: str, xray_mode: bool):
             r["domainRegex"] = reg
     else:
         # sing-box style
-        r = {"inbound": inbound, "outbound": outbound}
+        if outbound == DEFAULT_BLOCK_OUTBOUND:
+            r = {"inbound": inbound, "action": "reject"}
+        else:
+            r = {"inbound": inbound, "outbound": outbound}
         if suf:
             r["domain_suffix"] = suf
         if reg:
@@ -274,11 +277,12 @@ def generate_cidr_rules(inbound: str, cidr_list: List[str], outbound: str, xray_
             "outboundTag": outbound,
             "ip": list(cidr_list),
         }]
-    return [{
-        "inbound": inbound,
-        "outbound": outbound,
-        "ip_cidr": list(cidr_list),
-    }]
+    if outbound == DEFAULT_BLOCK_OUTBOUND:
+        base = {"inbound": inbound, "action": "reject"}
+    else:
+        base = {"inbound": inbound, "outbound": outbound}
+    base["ip_cidr"] = list(cidr_list)
+    return [base]
 
 # ---------- sanitize trailing commas ----------
 def _sanitize_trailing_commas(s: str) -> str:
