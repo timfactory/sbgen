@@ -218,7 +218,7 @@ def split_patterns(patterns) -> Tuple[List[str], List[str]]:
     return (domain_list, cidr_list)
 
 # ---------- rules ----------
-def generate_rules(inbound: str, patterns, outbound: str, xray_mode: bool):
+def generate_rules(inbound: str, patterns, outbound: str, xray_mode: bool, block_as_action: bool = False):
     suf: List[str] = []
     reg: List[str] = []
     ss, sr = set(), set()
@@ -256,7 +256,7 @@ def generate_rules(inbound: str, patterns, outbound: str, xray_mode: bool):
             r["domainRegex"] = reg
     else:
         # sing-box style
-        if outbound == DEFAULT_BLOCK_OUTBOUND:
+        if block_as_action and outbound == DEFAULT_BLOCK_OUTBOUND:
             r = {"inbound": inbound, "action": "reject"}
         else:
             r = {"inbound": inbound, "outbound": outbound}
@@ -267,7 +267,7 @@ def generate_rules(inbound: str, patterns, outbound: str, xray_mode: bool):
 
     return [r]
 
-def generate_cidr_rules(inbound: str, cidr_list: List[str], outbound: str, xray_mode: bool) -> List[Dict[str, Any]]:
+def generate_cidr_rules(inbound: str, cidr_list: List[str], outbound: str, xray_mode: bool, block_as_action: bool = False) -> List[Dict[str, Any]]:
     if not cidr_list:
         return []
     if xray_mode:
@@ -277,7 +277,7 @@ def generate_cidr_rules(inbound: str, cidr_list: List[str], outbound: str, xray_
             "outboundTag": outbound,
             "ip": list(cidr_list),
         }]
-    if outbound == DEFAULT_BLOCK_OUTBOUND:
+    if block_as_action and outbound == DEFAULT_BLOCK_OUTBOUND:
         base = {"inbound": inbound, "action": "reject"}
     else:
         base = {"inbound": inbound, "outbound": outbound}
@@ -434,8 +434,11 @@ def main():
 
     available_tags_list = collect_available_out_tags(tpl_json, args.xray)
     available_tags = set(available_tags_list)
+    has_block_outbound = DEFAULT_BLOCK_OUTBOUND in available_tags
+    block_as_action = not has_block_outbound and not args.xray
 
     debug_print(f"Available outbound tags: {available_tags_list}")
+    debug_print(f"Block as action: {block_as_action} (has_block_outbound={has_block_outbound})")
 
     # -------- YAML merge --------
     config: Dict[str, Dict[str, Any]] = {}
@@ -541,8 +544,8 @@ def main():
             outs = norm_list(lst.get("out"))
             for o in outs:
                 if o in available_tags:
-                    rules.extend(generate_rules(inbound, domain_pats, o, args.xray))
-                    rules.extend(generate_cidr_rules(inbound, cidr_pats, o, args.xray))
+                    rules.extend(generate_rules(inbound, domain_pats, o, args.xray, block_as_action))
+                    rules.extend(generate_cidr_rules(inbound, cidr_pats, o, args.xray, block_as_action))
                 else:
                     debug_print(f"Skip list out='{o}' (not present in template outbounds)")
 
@@ -582,8 +585,8 @@ def main():
         domain_bp, cidr_bp = split_patterns(bp)
         rules.extend(generate_rules(inbound, domain_dp, DEFAULT_FINAL_OUTBOUND, args.xray))
         rules.extend(generate_cidr_rules(inbound, cidr_dp, DEFAULT_FINAL_OUTBOUND, args.xray))
-        rules.extend(generate_rules(inbound, domain_bp, DEFAULT_BLOCK_OUTBOUND, args.xray))
-        rules.extend(generate_cidr_rules(inbound, cidr_bp, DEFAULT_BLOCK_OUTBOUND, args.xray))
+        rules.extend(generate_rules(inbound, domain_bp, DEFAULT_BLOCK_OUTBOUND, args.xray, block_as_action))
+        rules.extend(generate_cidr_rules(inbound, cidr_bp, DEFAULT_BLOCK_OUTBOUND, args.xray, block_as_action))
 
         rules_by_ph[tok] = rules
 
