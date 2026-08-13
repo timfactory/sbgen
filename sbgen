@@ -26,6 +26,9 @@ DEFAULT_FINAL_OUTBOUND = "direct"
 DEFAULT_BLOCK_OUTBOUND = "block"
 DEFAULT_URL_TIMEOUT = 30
 DEFAULT_USER_AGENT = "sbgen/1.0"
+# Reserved YAML profile tid for interface-agnostic routing (%%DEFAULTS%%).
+# In YAML the key must be quoted: "-":
+DEFAULT_PROFILE_TID = "-"
 
 def debug_print(msg: str):
     if DEBUG:
@@ -248,7 +251,7 @@ def split_patterns(patterns) -> Tuple[List[str], List[str]]:
     return (domain_list, cidr_list)
 
 # ---------- rules ----------
-def generate_rules(inbound: str, patterns, outbound: str, xray_mode: bool, block_as_action: bool = False):
+def generate_rules(inbound: Optional[str], patterns, outbound: str, xray_mode: bool, block_as_action: bool = False):
     suf: List[str] = []
     reg: List[str] = []
     ss, sr = set(), set()
@@ -277,9 +280,10 @@ def generate_rules(inbound: str, patterns, outbound: str, xray_mode: bool, block
         # Xray / V2Ray style
         r: Dict[str, Any] = {
             "type": "field",
-            "inboundTag": [inbound],
             "outboundTag": outbound,
         }
+        if inbound:
+            r["inboundTag"] = [inbound]
         if suf:
             r["domainSuffix"] = suf
         if reg:
@@ -287,9 +291,11 @@ def generate_rules(inbound: str, patterns, outbound: str, xray_mode: bool, block
     else:
         # sing-box style
         if block_as_action and outbound == DEFAULT_BLOCK_OUTBOUND:
-            r = {"inbound": inbound, "action": "reject"}
+            r: Dict[str, Any] = {"action": "reject"}
         else:
-            r = {"inbound": inbound, "outbound": outbound}
+            r = {"outbound": outbound}
+        if inbound:
+            r["inbound"] = inbound
         if suf:
             r["domain_suffix"] = suf
         if reg:
@@ -297,20 +303,24 @@ def generate_rules(inbound: str, patterns, outbound: str, xray_mode: bool, block
 
     return [r]
 
-def generate_cidr_rules(inbound: str, cidr_list: List[str], outbound: str, xray_mode: bool, block_as_action: bool = False) -> List[Dict[str, Any]]:
+def generate_cidr_rules(inbound: Optional[str], cidr_list: List[str], outbound: str, xray_mode: bool, block_as_action: bool = False) -> List[Dict[str, Any]]:
     if not cidr_list:
         return []
     if xray_mode:
-        return [{
+        r: Dict[str, Any] = {
             "type": "field",
-            "inboundTag": [inbound],
             "outboundTag": outbound,
             "ip": list(cidr_list),
-        }]
+        }
+        if inbound:
+            r["inboundTag"] = [inbound]
+        return [r]
     if block_as_action and outbound == DEFAULT_BLOCK_OUTBOUND:
-        base = {"inbound": inbound, "action": "reject"}
+        base: Dict[str, Any] = {"action": "reject"}
     else:
-        base = {"inbound": inbound, "outbound": outbound}
+        base = {"outbound": outbound}
+    if inbound:
+        base["inbound"] = inbound
     base["ip_cidr"] = list(cidr_list)
     return [base]
 
@@ -326,16 +336,18 @@ def _sanitize_trailing_commas(s: str) -> str:
 # ---------- placeholders ----------
 _PLACEH_RX = r'%%([^%:\s]+):([^%]+)%%'
 _FINAL_TOKEN = "%%FINAL%%"
+_DEFAULTS_TOKEN = "%%DEFAULTS%%"
 
 def _quote_unquoted_placeholders(text: str) -> str:
     text = re.sub(r'(?<!")(' + _PLACEH_RX + r')(?!")', r'"\1"', text)
     text = re.sub(r'(?<!")(' + re.escape(_FINAL_TOKEN) + r')(?!")', r'"\1"', text)
+    text = re.sub(r'(?<!")(' + re.escape(_DEFAULTS_TOKEN) + r')(?!")', r'"\1"', text)
     return text
 
 def _find_placeholders(node):
     f = []
     if isinstance(node, str):
-        if re.fullmatch(_PLACEH_RX, node) or node == _FINAL_TOKEN:
+        if re.fullmatch(_PLACEH_RX, node) or node == _FINAL_TOKEN or node == _DEFAULTS_TOKEN:
             f.append(node)
     elif isinstance(node, list):
         for i in node:
@@ -402,7 +414,7 @@ def main():
     global DEBUG
 
     ap = argparse.ArgumentParser(description="Generate sing-box/xray JSON from template + YAML config(s).")
-    ap.add_argument("template", help="Path to JSON template with placeholders like %%tid:inbound%% (quoted or bare)")
+    ap.add_argument("template", help="Path to JSON template with placeholders like %%tid:inbound%% or %%DEFAULTS%% (quoted or bare)")
     ap.add_argument("yamls", nargs="+", help="One or more YAML files with rules")
     ap.add_argument("-v","--verbose", action="store_true", help="Enable debug logging to stderr")
     ap.add_argument("-b","--base-dir", dest="cli_base_dir", default=None,
@@ -548,18 +560,9 @@ def main():
     placeholders = _find_placeholders(tpl_json)
     debug_print(f"Placeholders in AST (order): {placeholders}")
 
-    # -------- build rules --------
-    rules_by_ph: Dict[str, List[Dict[str, Any]]] = {}
-
-    for tok in placeholders:
-        m = re.fullmatch(_PLACEH_RX, tok)
-        if not m:
-            continue
-        tid, inbound = m.group(1), m.group(2)
-
+    def build_rules_for_profile(tid: str, inbound: Optional[str]) -> List[Dict[str, Any]]:
         if tid not in config:
-            rules_by_ph[tok] = []
-            continue
+            return []
 
         sec = config[tid]
         rules: List[Dict[str, Any]] = []
@@ -618,8 +621,23 @@ def main():
         rules.extend(generate_cidr_rules(inbound, cidr_dp, DEFAULT_FINAL_OUTBOUND, args.xray))
         rules.extend(generate_rules(inbound, domain_bp, DEFAULT_BLOCK_OUTBOUND, args.xray, block_as_action))
         rules.extend(generate_cidr_rules(inbound, cidr_bp, DEFAULT_BLOCK_OUTBOUND, args.xray, block_as_action))
+        return rules
 
-        rules_by_ph[tok] = rules
+    # -------- build rules --------
+    rules_by_ph: Dict[str, List[Dict[str, Any]]] = {}
+
+    for tok in placeholders:
+        if tok == _DEFAULTS_TOKEN:
+            rules = build_rules_for_profile(DEFAULT_PROFILE_TID, None)
+            debug_print(f"{_DEFAULTS_TOKEN}: {len(rules)} rule(s) from tid={DEFAULT_PROFILE_TID!r} (no inbound)")
+            rules_by_ph[tok] = rules
+            continue
+
+        m = re.fullmatch(_PLACEH_RX, tok)
+        if not m:
+            continue
+        tid, inbound = m.group(1), m.group(2)
+        rules_by_ph[tok] = build_rules_for_profile(tid, inbound)
 
     # -------- FINAL --------
     final_value = None

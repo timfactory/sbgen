@@ -96,6 +96,43 @@ russia:
 
 ---
 
+## ⭐ Профиль по умолчанию и `%%DEFAULTS%%`
+
+Зарезервированный tid профиля: **`-`**. В YAML ключ нужно кавычить:
+
+```yaml
+"-":
+  base_dir: ./lists
+  lists:
+    - name: world
+      out: [ proxy ]
+      includes: [ world.list ]
+  direct:
+    - includes: [ direct.list ]
+  blocked:
+    - includes: [ block.list ]
+```
+
+Плейсхолдер **`%%DEFAULTS%%`** подставляет правила из профиля `-` **без** привязки к inbound (`inbound` / `inboundTag` не добавляются). Удобно для общей маршрутизации по спискам для всех интерфейсов.
+
+В шаблоне:
+
+```json
+{
+  "route": {
+    "rules": [
+      %%DEFAULTS%%,
+      %%russia:in-tun%%
+    ],
+    "final": "%%FINAL%%"
+  }
+}
+```
+
+Обычные плейсхолдеры `%%tid:inbound%%` по-прежнему генерируют правила с полем `inbound`.
+
+---
+
 ### 🔸 Элементы `lists`
 
 Каждый элемент может включать:
@@ -106,7 +143,7 @@ russia:
 | `out` | `string` или `list<string>` | Один или несколько `outbound`, куда направлять трафик. |
 | `patterns` | `list<string>` | Список шаблонов доменов и/или CIDR (IPv4/IPv6 с префиксом). |
 | `includes` | `list<string>` | Пути к внешним файлам (по одному домену на строку, `#` — комментарий). |
-| `urls` | `list<string>` | URL'ы списков в том же формате, что и `includes`; загружаются по HTTP(S) с кэшем (по умолчанию `~/.cache/sbgen`; `-c`/`--cache-dir`, `-r`/`--refresh`; при ошибке загрузки используется старый кэш). |
+| `urls` | `list<string>` | URL'ы списков в том же формате, что и `includes`; загружаются по HTTP(S) с кэшем (по умолчанию `~/.cache/sbgen`; `-c`/`--cache-dir`, `-r`/`--refresh`; при ошибке загрузки используется старый кэш). HTTP(S)-прокси через `HTTP_PROXY` / `HTTPS_PROXY` (см. [Загрузка по URL и прокси](#-загрузка-по-url-и-прокси)). |
 
 ---
 
@@ -162,18 +199,86 @@ facebook.com
 
 ---
 
+## 🌐 Загрузка по URL и прокси
+
+Списки из поля `urls` скачиваются по HTTP(S). Запросы идут через `ProxyHandler`, который читает стандартные переменные окружения (поддерживаются и заглавные, и строчные имена):
+
+| Переменная | Назначение |
+|------------|------------|
+| `HTTP_PROXY` / `http_proxy` | Прокси для HTTP URL |
+| `HTTPS_PROXY` / `https_proxy` | Прокси для HTTPS URL |
+| `ALL_PROXY` / `all_proxy` | Общий прокси для любой схемы |
+| `NO_PROXY` / `no_proxy` | Список хостов через запятую без прокси |
+
+**Пример:**
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:7890
+export HTTP_PROXY=http://127.0.0.1:7890
+./sbgen template.tpl profiles.yml -v > config.json
+```
+
+С флагом `-v` настроенные прокси выводятся в stderr (учётные данные в URL прокси маскируются).
+
+**Примечание:** встроенный `urllib` поддерживает HTTP/HTTPS-прокси. SOCKS в переменных окружения может потребовать HTTP-фронт (например, от sing-box/clash) или дополнительные зависимости.
+
+### Схема загрузки URL
+
+```mermaid
+flowchart TD
+    A["URL из поля urls"] --> B{"-r / --refresh?"}
+    B -->|Нет| C{"Есть файл кэша?"}
+    B -->|Да| F["HTTP(S) GET"]
+    C -->|Да| D["Чтение ~/.cache/sbgen/<sha256>.txt"]
+    C -->|Нет| F
+    D --> P["Разбор паттернов"]
+    F --> E["ProxyHandler читает env:<br/>HTTP_PROXY, HTTPS_PROXY,<br/>ALL_PROXY, NO_PROXY"]
+    E --> G{"Загрузка успешна?"}
+    G -->|Да| H["Запись / обновление кэша"]
+    H --> P
+    G -->|Нет| I{"Есть старый кэш?"}
+    I -->|Да| J["Использовать кэш + предупреждение в stderr"]
+    J --> P
+    I -->|Нет| K["Пустой список + ошибка в stderr"]
+```
+
+---
+
 ## 🧠 Логика работы sbgen
+
+```mermaid
+flowchart TD
+    Start([Старт]) --> Load["Загрузка .tpl + YAML"]
+    Load --> Sanitize["Санитизация JSON<br/>(trailing commas, кавычки у плейсхолдеров)"]
+    Sanitize --> Append{"-a / --append?"}
+    Append -->|Да| AppendRules["Добавление в route/routing.rules[]"]
+    Append -->|No| OutTags
+    AppendRules --> OutTags["Сбор тегов outbound из шаблона"]
+    OutTags --> Merge["Объединение профилей по tid"]
+    Merge --> FindPH["Поиск плейсхолдеров %%tid:inbound%% и %%DEFAULTS%%"]
+    FindPH --> Loop{"Для каждого плейсхолдера"}
+    Loop --> LoadPats["Загрузка паттернов:<br/>includes, urls, inline"]
+    LoadPats --> Resolve["Разрешение путей includes<br/>(item base → tid base_dir → -b → cwd)"]
+    Resolve --> UrlFetch["Загрузка urls<br/>(кэш / прокси / fallback)"]
+    UrlFetch --> Split["Разделение домен / CIDR"]
+    Split --> GenRules["Правила для lists, direct, blocked<br/>(с inbound или без для %%DEFAULTS%%)"]
+    GenRules --> Loop
+    Loop --> Final["Вычисление %%FINAL%%<br/>(default_direct + доступные out)"]
+    Final --> Replace["Подстановка плейсхолдеров в AST"]
+    Replace --> Output(["Вывод JSON в stdout"])
+```
 
 1. Загружает `.tpl` шаблон и все YAML-файлы.  
 2. Санитизирует JSON (удаляет trailing commas, заключает незакавыченные плейсхолдеры в кавычки).  
-3. Объединяет все верхнеуровневые ключи (`tid`), например, `russia`, `china`.  
+3. Объединяет все верхнеуровневые ключи (`tid`), например, `russia`, `china`, `-`.  
 4. Собирает доступные теги outbound'ов из шаблона.  
-5. Ищет плейсхолдеры вида `%%russia:in-tun%%` или `"%%russia:in-tun%%"` в шаблоне.  
+5. Ищет плейсхолдеры вида `%%russia:in-tun%%`, `%%DEFAULTS%%` или `"%%FINAL%%"` в шаблоне.  
 6. Для каждого плейсхолдера:
    - Загружает паттерны из секций `lists`, `direct` и `blocked`
    - Разрешает пути `includes` (относительно `base_dir`, базовой директории элемента или CLI `-b`)
+   - Загружает списки по `urls` (см. [Загрузка по URL и прокси](#-загрузка-по-url-и-прокси))
    - Разделяет паттерны на доменные (`domain_suffix`/`domain_regex`) и CIDR; для CIDR генерирует отдельные правила с `ip_cidr` (или `ip` в Xray)
-   - Генерирует правила маршрутизации для указанного inbound
+   - Для `%%tid:inbound%%` генерирует правила с привязкой к inbound; для `%%DEFAULTS%%` — из профиля `-` без inbound
 7. Заменяет плейсхолдеры на сгенерированные массивы правил.  
 8. Вычисляет `%%FINAL%%` на основе `default_direct` и доступных outbound'ов.  
 9. Выводит валидный JSON в stdout.  
@@ -487,10 +592,11 @@ myprofile:
 
 Выводит в stderr:
 - Пути к шаблону и YAML файлам
+- Настройки прокси из окружения (учётные данные маскируются)
 - Базовые директории для каждого профиля
 - Доступные теги outbound'ов
 - Найденные плейсхолдеры
-- Загрузку паттернов из includes
+- Загрузку паттернов из includes и URL (кэш или сеть)
 - Количество сгенерированных правил
 - Выбор FINAL outbound
 

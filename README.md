@@ -96,6 +96,43 @@ russia:
 
 ---
 
+## ⭐ Default profile and `%%DEFAULTS%%`
+
+Reserved profile tid: **`-`**. In YAML the key must be quoted:
+
+```yaml
+"-":
+  base_dir: ./lists
+  lists:
+    - name: world
+      out: [ proxy ]
+      includes: [ world.list ]
+  direct:
+    - includes: [ direct.list ]
+  blocked:
+    - includes: [ block.list ]
+```
+
+The **`%%DEFAULTS%%`** placeholder expands rules from profile `-` **without** binding to an inbound (`inbound` / `inboundTag` omitted). Use it for list-based routing that applies to all interfaces.
+
+In a template:
+
+```json
+{
+  "route": {
+    "rules": [
+      %%DEFAULTS%%,
+      %%russia:in-tun%%
+    ],
+    "final": "%%FINAL%%"
+  }
+}
+```
+
+Regular `%%tid:inbound%%` placeholders still generate rules with an `inbound` field.
+
+---
+
 ### 🔹 Elements of `lists`
 
 Each `lists` item may contain:
@@ -106,7 +143,7 @@ Each `lists` item may contain:
 | `out` | `string or list<string>` | One or more outbounds to route traffic to. |
 | `patterns` | `list<string>` | Inline domain patterns and/or CIDR entries (IPv4/IPv6 with prefix). |
 | `includes` | `list<string>` | Paths to external lists (one domain per line, `#` for comments). |
-| `urls` | `list<string>` | URLs of lists in the same format as `includes`; fetched over HTTP(S) with caching (default: `~/.cache/sbgen`; `-c`/`--cache-dir`, `-r`/`--refresh`; on fetch error the existing cache is used). |
+| `urls` | `list<string>` | URLs of lists in the same format as `includes`; fetched over HTTP(S) with caching (default: `~/.cache/sbgen`; `-c`/`--cache-dir`, `-r`/`--refresh`; on fetch error the existing cache is used). HTTP(S) proxy via `HTTP_PROXY` / `HTTPS_PROXY` env vars (see [URL Fetching and Proxy](#-url-fetching-and-proxy)). |
 
 ---
 
@@ -162,18 +199,86 @@ facebook.com
 
 ---
 
+## 🌐 URL Fetching and Proxy
+
+Lists from the `urls` field are downloaded over HTTP(S). Requests use a `ProxyHandler` that reads standard environment variables (uppercase and lowercase names are both supported):
+
+| Variable | Purpose |
+|----------|---------|
+| `HTTP_PROXY` / `http_proxy` | Proxy for HTTP URLs |
+| `HTTPS_PROXY` / `https_proxy` | Proxy for HTTPS URLs |
+| `ALL_PROXY` / `all_proxy` | Fallback proxy for any scheme |
+| `NO_PROXY` / `no_proxy` | Comma-separated hosts that bypass the proxy |
+
+**Example:**
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:7890
+export HTTP_PROXY=http://127.0.0.1:7890
+./sbgen template.tpl profiles.yml -v > config.json
+```
+
+With `-v`, configured proxies are printed to stderr (credentials in proxy URLs are redacted).
+
+**Note:** Built-in `urllib` proxy support covers HTTP/HTTPS proxies. SOCKS URLs in environment variables may require an HTTP front-end (e.g. from sing-box/clash) or extra dependencies.
+
+### URL fetch flow
+
+```mermaid
+flowchart TD
+    A["URL from urls field"] --> B{"-r / --refresh?"}
+    B -->|No| C{"Cache file exists?"}
+    B -->|Yes| F["HTTP(S) GET"]
+    C -->|Yes| D["Read ~/.cache/sbgen/<sha256>.txt"]
+    C -->|No| F
+    D --> P["Parse patterns"]
+    F --> E["ProxyHandler reads env:<br/>HTTP_PROXY, HTTPS_PROXY,<br/>ALL_PROXY, NO_PROXY"]
+    E --> G{"Download OK?"}
+    G -->|Yes| H["Write / update cache"]
+    H --> P
+    G -->|No| I{"Stale cache exists?"}
+    I -->|Yes| J["Use cache + stderr warning"]
+    J --> P
+    I -->|No| K["Empty list + stderr error"]
+```
+
+---
+
 ## 🧠 sbgen Logic
+
+```mermaid
+flowchart TD
+    Start([Start]) --> Load["Load .tpl + YAML files"]
+    Load --> Sanitize["Sanitize JSON<br/>(trailing commas, quote placeholders)"]
+    Sanitize --> Append{"-a / --append?"}
+    Append -->|Yes| AppendRules["Append to route/routing.rules[]"]
+    Append -->|No| OutTags
+    AppendRules --> OutTags["Collect outbound tags from template"]
+    OutTags --> Merge["Merge profiles by tid"]
+    Merge --> FindPH["Find %%tid:inbound%% and %%DEFAULTS%%"]
+    FindPH --> Loop{"For each placeholder"}
+    Loop --> LoadPats["Load patterns:<br/>includes, urls, inline"]
+    LoadPats --> Resolve["Resolve includes paths<br/>(item base → tid base_dir → -b → cwd)"]
+    Resolve --> UrlFetch["Fetch urls<br/>(cache / proxy / fallback)"]
+    UrlFetch --> Split["Split domain vs CIDR patterns"]
+    Split --> GenRules["Generate rules for lists, direct, blocked<br/>(with inbound, or none for %%DEFAULTS%%)"]
+    GenRules --> Loop
+    Loop --> Final["Resolve %%FINAL%%<br/>(default_direct + available out)"]
+    Final --> Replace["Replace placeholders in AST"]
+    Replace --> Output(["Print JSON to stdout"])
+```
 
 1. Loads the `.tpl` template and all YAML files.  
 2. Sanitizes JSON (removes trailing commas, quotes unquoted placeholders).  
-3. Merges all top-level keys (`tid`), e.g., `russia`, `china`.  
+3. Merges all top-level keys (`tid`), e.g., `russia`, `china`, `-`.  
 4. Collects available outbound tags from the template.  
-5. Finds placeholders like `%%russia:in-tun%%` or `"%%russia:in-tun%%"` in the template.  
+5. Finds placeholders like `%%russia:in-tun%%`, `%%DEFAULTS%%`, or `"%%FINAL%%"` in the template.  
 6. For each placeholder:
    - Loads patterns from `lists`, `direct`, and `blocked` sections
    - Resolves `includes` files (relative to `base_dir`, item base, or CLI `-b`)
+   - Fetches `urls` lists (see [URL Fetching and Proxy](#-url-fetching-and-proxy))
    - Splits patterns into domain (`domain_suffix`/`domain_regex`) and CIDR; CIDR entries produce separate rules with `ip_cidr` (or `ip` in Xray)
-   - Generates routing rules for the specified inbound
+   - For `%%tid:inbound%%`, generates rules bound to that inbound; for `%%DEFAULTS%%`, uses profile `-` with no inbound
 7. Replaces placeholders with generated rule arrays.  
 8. Computes `%%FINAL%%` based on `default_direct` and available outbounds.  
 9. Outputs valid JSON to stdout.  
@@ -487,10 +592,11 @@ To enable debug mode:
 
 This prints to stderr:
 - Template and YAML file paths
+- Proxy settings from environment (credentials redacted)
 - Base directories for each profile
 - Available outbound tags
 - Found placeholders
-- Pattern loading from includes
+- Pattern loading from includes and URLs (cache vs network)
 - Generated rules count
 - FINAL outbound selection
 
