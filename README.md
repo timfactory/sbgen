@@ -129,7 +129,7 @@ In a template:
 }
 ```
 
-Regular `%%tid:inbound%%` placeholders still generate rules with an `inbound` field.
+Regular `%%tid:inbound%%` (or `%%tid:in1,in2#d6%%`) placeholders generate rules with an `inbound` field.
 
 ---
 
@@ -144,6 +144,34 @@ Each `lists` item may contain:
 | `patterns` | `list<string>` | Inline domain patterns and/or CIDR entries (IPv4/IPv6 with prefix). |
 | `includes` | `list<string>` | Paths to external lists (one domain per line, `#` for comments). |
 | `urls` | `list<string>` | URLs of lists in the same format as `includes`; fetched over HTTP(S) with caching (default: `~/.cache/sbgen`; `-c`/`--cache-dir`, `-r`/`--refresh`; on fetch error the existing cache is used). HTTP(S) proxy via `HTTP_PROXY` / `HTTPS_PROXY` env vars (see [URL Fetching and Proxy](#-url-fetching-and-proxy)). |
+| `direct6` | `bool` | If `true` and the placeholder has an inbound with `#d6`, emit `resolve` (`prefer_ipv6`) and `::/0` → `direct` on those inbounds before the list rules; IPv6 CIDRs from the list go only to inbounds **without** `#d6`. Sing-box only (ignored with `-x`). |
+| `resolve6` | `string` | DNS server tag for `action: resolve` when `direct6` is set (e.g. `dns-v6`). |
+
+---
+
+## 🔀 Multiple inbounds and `#d6`
+
+The `%%tid:…%%` placeholder accepts one or more inbounds, comma-separated. After an inbound name, `#` introduces flags:
+
+```text
+%%russia:in-russia-split,in-russia-split4#d6%%
+```
+
+- Multiple inbounds → `"inbound": ["in-russia-split", "in-russia-split4"]` (a single inbound stays a string).
+- `#d6` on an inbound: for a list with `direct6: true`, that inbound gets resolve + all IPv6 to `direct`; the list's IPv6 CIDRs are routed only on inbounds without `#d6`.
+
+Example list:
+
+```yaml
+- name: world
+  out: [ out-world, proxy ]
+  direct6: true
+  resolve6: dns-v6
+  includes: [ world.list ]
+  urls: [ "https://core.telegram.org/resources/cidr.txt" ]
+```
+
+Rule order for such a list: preamble (`resolve` + `::/0`) → IPv4 CIDR → IPv6 CIDR (non-`#d6`) → domains.
 
 ---
 
@@ -278,7 +306,7 @@ flowchart TD
    - Resolves `includes` files (relative to `base_dir`, item base, or CLI `-b`)
    - Fetches `urls` lists (see [URL Fetching and Proxy](#-url-fetching-and-proxy))
    - Splits patterns into domain (`domain_suffix`/`domain_regex`) and CIDR; CIDR entries produce separate rules with `ip_cidr` (or `ip` in Xray)
-   - For `%%tid:inbound%%`, generates rules bound to that inbound; for `%%DEFAULTS%%`, uses profile `-` with no inbound
+   - For `%%tid:inbound%%` / `%%tid:in1,in2#d6%%`, generates rules bound to that inbound (array when multiple; `#d6` + `direct6`/`resolve6` for the IPv6-direct branch); for `%%DEFAULTS%%`, uses profile `-` with no inbound
 7. Replaces placeholders with generated rule arrays.  
 8. Computes `%%FINAL%%` based on `default_direct` and available outbounds.  
 9. Outputs valid JSON to stdout.  
@@ -391,7 +419,126 @@ russia:
 
 ---
 
-## 🌍 Example 4 — Multiple YAML Profiles
+## ⭐ Example 4 — `%%DEFAULTS%%` (rules without inbound binding)
+
+Shared `direct`/`blocked` (and optionally `lists`) live in profile `-` and expand via `%%DEFAULTS%%` — with no `inbound` field.
+
+**YAML (`profiles.yml`):**
+```yaml
+"-":
+  base_dir: ./lists
+  direct:
+    - includes: [ direct.list ]
+  blocked:
+    - includes: [ block.list ]
+
+russia:
+  lists:
+    - out: proxy
+      patterns: [ "youtube.com" ]
+```
+
+**Template:**
+```json
+{
+  "outbounds": [
+    { "tag": "proxy", "type": "direct" },
+    { "tag": "direct", "type": "direct" }
+  ],
+  "route": {
+    "rules": [
+      %%DEFAULTS%%,
+      %%russia:in-tun%%
+    ],
+    "final": "%%FINAL%%"
+  }
+}
+```
+
+**Result (excerpt):**
+```json
+{
+  "route": {
+    "rules": [
+      { "outbound": "direct", "domain_suffix": ["intranet.local"] },
+      { "action": "reject", "domain_suffix": ["ads.example"] },
+      { "inbound": "in-tun", "outbound": "proxy", "domain_suffix": ["youtube.com"] }
+    ],
+    "final": "direct"
+  }
+}
+```
+
+Rules from `%%DEFAULTS%%` apply to all interfaces; `%%russia:in-tun%%` only to `in-tun`.
+
+---
+
+## 🔀 Example 5 — Multiple inbounds and split IPv6 handling (`#d6` / `direct6`)
+
+Two mixed inbounds: full dual-stack and “IPv4-proxy only” (`#d6`), where IPv6 goes `direct` for lists with `direct6: true`.
+
+**YAML:**
+```yaml
+russia:
+  lists:
+    - name: israel
+      out: [ out-isl ]
+      patterns: [ "myip.com" ]
+    - name: world
+      out: [ out-world ]
+      direct6: true
+      resolve6: dns-v6
+      patterns:
+        - "2ip.io"
+        - "91.108.56.0/22"
+        - "2001:b28:f23d::/48"
+```
+
+**Template:**
+```json
+{
+  "inbounds": [
+    { "tag": "in-russia-split",  "type": "mixed", "listen": "0.0.0.0", "listen_port": 11001 },
+    { "tag": "in-russia-split4", "type": "mixed", "listen": "0.0.0.0", "listen_port": 11005 }
+  ],
+  "outbounds": [
+    { "tag": "out-isl", "type": "direct" },
+    { "tag": "out-world", "type": "direct" },
+    { "tag": "direct", "type": "direct" }
+  ],
+  "route": {
+    "rules": [
+      { "inbound": "in-russia-split",  "action": "sniff" },
+      { "inbound": "in-russia-split4", "action": "sniff" },
+      %%russia:in-russia-split,in-russia-split4#d6%%
+    ],
+    "final": "direct"
+  }
+}
+```
+
+**Result (`route.rules` excerpt):**
+```json
+[
+  { "inbound": "in-russia-split",  "action": "sniff" },
+  { "inbound": "in-russia-split4", "action": "sniff" },
+
+  { "inbound": ["in-russia-split", "in-russia-split4"], "outbound": "out-isl", "domain_suffix": ["myip.com"] },
+
+  { "inbound": "in-russia-split4", "server": "dns-v6", "strategy": "prefer_ipv6", "action": "resolve" },
+  { "inbound": "in-russia-split4", "ip_cidr": ["::/0"], "action": "route", "outbound": "direct" },
+
+  { "inbound": ["in-russia-split", "in-russia-split4"], "outbound": "out-world", "ip_cidr": ["91.108.56.0/22"] },
+  { "inbound": "in-russia-split", "outbound": "out-world", "ip_cidr": ["2001:b28:f23d::/48"] },
+  { "inbound": ["in-russia-split", "in-russia-split4"], "outbound": "out-world", "domain_suffix": ["2ip.io"] }
+]
+```
+
+On `in-russia-split4`, IPv6 for list `world` goes `direct`; IPv6 CIDRs are proxied only via `in-russia-split`.
+
+---
+
+## 🌍 Example 6 — Multiple YAML Profiles
 
 ```bash
 ./sbgen standalone-world.tpl profiles.yml > config.json
@@ -403,11 +550,11 @@ russia:
 
 ---
 
-## 🔧 Example 5 — Using `-a` (--append) Option
+## 🔧 Example 7 — Using `-a` (--append) Option
 
 The `-a` option allows you to inject custom rules into `route.rules[]` (or `routing.rules[]` in Xray mode) **before** placeholder processing. This is useful for adding priority rules or rules that don't fit the YAML structure.
 
-### Example 5.1 — Append a Single Rule (String Placeholder)
+### Example 7.1 — Append a Single Rule (String Placeholder)
 
 Append a placeholder that will be processed later:
 
@@ -417,7 +564,7 @@ Append a placeholder that will be processed later:
 
 This adds `%%russia:in-extra%%` to the rules array, which will be replaced during placeholder processing if it exists in the template context.
 
-### Example 5.2 — Append a Single Rule (JSON Object)
+### Example 7.2 — Append a Single Rule (JSON Object)
 
 Add a custom rule directly:
 

@@ -17,7 +17,7 @@ import argparse
 import hashlib
 import urllib.request
 from urllib.parse import urlsplit, urlunsplit
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 DEBUG = False
 DEFAULT_CACHE_DIR = "~/.cache/sbgen"
@@ -250,8 +250,58 @@ def split_patterns(patterns) -> Tuple[List[str], List[str]]:
             domain_list.append(raw)
     return (domain_list, cidr_list)
 
+# ---------- inbound spec (%%tid:in1,in2#d6%%) ----------
+InboundEntry = Tuple[str, Set[str]]
+InboundField = Optional[Union[str, List[str]]]
+
+def parse_inbound_spec(spec: str) -> List[InboundEntry]:
+    """Parse 'in-a,in-b#d6' into [(name, flags), ...]."""
+    out: List[InboundEntry] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        bits = part.split("#")
+        name = bits[0].strip()
+        if not name:
+            continue
+        flags = {b.strip().lower() for b in bits[1:] if b.strip()}
+        out.append((name, flags))
+    return out
+
+def inbound_field(tags: Optional[List[str]]) -> InboundField:
+    """None / single string / list of tags for sing-box inbound field."""
+    if not tags:
+        return None
+    if len(tags) == 1:
+        return tags[0]
+    return list(tags)
+
+def _apply_inbound(rule: Dict[str, Any], inbound: InboundField, xray_mode: bool) -> None:
+    if not inbound:
+        return
+    tags = inbound if isinstance(inbound, list) else [inbound]
+    if xray_mode:
+        rule["inboundTag"] = list(tags)
+    else:
+        rule["inbound"] = tags[0] if len(tags) == 1 else list(tags)
+
+def split_cidrs_v4_v6(cidr_list: List[str]) -> Tuple[List[str], List[str]]:
+    v4: List[str] = []
+    v6: List[str] = []
+    for c in cidr_list:
+        try:
+            net = ipaddress.ip_network(c, strict=False)
+        except ValueError:
+            continue
+        if net.version == 6:
+            v6.append(c)
+        else:
+            v4.append(c)
+    return v4, v6
+
 # ---------- rules ----------
-def generate_rules(inbound: Optional[str], patterns, outbound: str, xray_mode: bool, block_as_action: bool = False):
+def generate_rules(inbound: InboundField, patterns, outbound: str, xray_mode: bool, block_as_action: bool = False):
     suf: List[str] = []
     reg: List[str] = []
     ss, sr = set(), set()
@@ -282,8 +332,7 @@ def generate_rules(inbound: Optional[str], patterns, outbound: str, xray_mode: b
             "type": "field",
             "outboundTag": outbound,
         }
-        if inbound:
-            r["inboundTag"] = [inbound]
+        _apply_inbound(r, inbound, True)
         if suf:
             r["domainSuffix"] = suf
         if reg:
@@ -291,11 +340,10 @@ def generate_rules(inbound: Optional[str], patterns, outbound: str, xray_mode: b
     else:
         # sing-box style
         if block_as_action and outbound == DEFAULT_BLOCK_OUTBOUND:
-            r: Dict[str, Any] = {"action": "reject"}
+            r = {"action": "reject"}
         else:
             r = {"outbound": outbound}
-        if inbound:
-            r["inbound"] = inbound
+        _apply_inbound(r, inbound, False)
         if suf:
             r["domain_suffix"] = suf
         if reg:
@@ -303,7 +351,7 @@ def generate_rules(inbound: Optional[str], patterns, outbound: str, xray_mode: b
 
     return [r]
 
-def generate_cidr_rules(inbound: Optional[str], cidr_list: List[str], outbound: str, xray_mode: bool, block_as_action: bool = False) -> List[Dict[str, Any]]:
+def generate_cidr_rules(inbound: InboundField, cidr_list: List[str], outbound: str, xray_mode: bool, block_as_action: bool = False) -> List[Dict[str, Any]]:
     if not cidr_list:
         return []
     if xray_mode:
@@ -312,17 +360,45 @@ def generate_cidr_rules(inbound: Optional[str], cidr_list: List[str], outbound: 
             "outboundTag": outbound,
             "ip": list(cidr_list),
         }
-        if inbound:
-            r["inboundTag"] = [inbound]
+        _apply_inbound(r, inbound, True)
         return [r]
     if block_as_action and outbound == DEFAULT_BLOCK_OUTBOUND:
         base: Dict[str, Any] = {"action": "reject"}
     else:
         base = {"outbound": outbound}
-    if inbound:
-        base["inbound"] = inbound
+    _apply_inbound(base, inbound, False)
     base["ip_cidr"] = list(cidr_list)
     return [base]
+
+def generate_direct6_preamble(d6_tags: List[str], resolve6: Optional[str], list_name: str) -> List[Dict[str, Any]]:
+    """Resolve prefer_ipv6 + ::/0 → direct for each #d6 inbound (sing-box only)."""
+    if not d6_tags:
+        return []
+    if not isinstance(resolve6, str) or not resolve6.strip():
+        print(
+            f"direct6 set but resolve6 missing/empty for list {list_name!r}; skipping resolve rules",
+            file=sys.stderr,
+        )
+        resolve_server = None
+    else:
+        resolve_server = resolve6.strip()
+
+    rules: List[Dict[str, Any]] = []
+    for tag in d6_tags:
+        if resolve_server:
+            rules.append({
+                "inbound": tag,
+                "server": resolve_server,
+                "strategy": "prefer_ipv6",
+                "action": "resolve",
+            })
+        rules.append({
+            "inbound": tag,
+            "ip_cidr": ["::/0"],
+            "action": "route",
+            "outbound": DEFAULT_FINAL_OUTBOUND,
+        })
+    return rules
 
 # ---------- sanitize trailing commas ----------
 def _sanitize_trailing_commas(s: str) -> str:
@@ -414,7 +490,7 @@ def main():
     global DEBUG
 
     ap = argparse.ArgumentParser(description="Generate sing-box/xray JSON from template + YAML config(s).")
-    ap.add_argument("template", help="Path to JSON template with placeholders like %%tid:inbound%% or %%DEFAULTS%% (quoted or bare)")
+    ap.add_argument("template", help="Path to JSON template with placeholders like %%tid:in1,in2#d6%% or %%DEFAULTS%% (quoted or bare)")
     ap.add_argument("yamls", nargs="+", help="One or more YAML files with rules")
     ap.add_argument("-v","--verbose", action="store_true", help="Enable debug logging to stderr")
     ap.add_argument("-b","--base-dir", dest="cli_base_dir", default=None,
@@ -560,12 +636,27 @@ def main():
     placeholders = _find_placeholders(tpl_json)
     debug_print(f"Placeholders in AST (order): {placeholders}")
 
-    def build_rules_for_profile(tid: str, inbound: Optional[str]) -> List[Dict[str, Any]]:
+    def build_rules_for_profile(
+        tid: str,
+        inbound_entries: Optional[List[InboundEntry]],
+    ) -> List[Dict[str, Any]]:
         if tid not in config:
             return []
 
         sec = config[tid]
         rules: List[Dict[str, Any]] = []
+
+        if inbound_entries is None:
+            # %%DEFAULTS%% — no inbound binding, no #d6 branch
+            all_tags: Optional[List[str]] = None
+            d6_tags: List[str] = []
+            non_d6_tags: List[str] = []
+            inbound_all: InboundField = None
+        else:
+            all_tags = [name for name, _ in inbound_entries]
+            d6_tags = [name for name, flags in inbound_entries if "d6" in flags]
+            non_d6_tags = [name for name, flags in inbound_entries if "d6" not in flags]
+            inbound_all = inbound_field(all_tags)
 
         # lists
         for lst in sec["lists"]:
@@ -576,12 +667,37 @@ def main():
             pats += norm_list(lst.get("patterns"))
             domain_pats, cidr_pats = split_patterns(pats)
             outs = norm_list(lst.get("out"))
+            available_outs = [o for o in outs if isinstance(o, str) and o in available_tags]
             for o in outs:
-                if o in available_tags:
-                    rules.extend(generate_rules(inbound, domain_pats, o, args.xray, block_as_action))
-                    rules.extend(generate_cidr_rules(inbound, cidr_pats, o, args.xray, block_as_action))
-                else:
+                if not isinstance(o, str) or o not in available_tags:
                     debug_print(f"Skip list out='{o}' (not present in template outbounds)")
+
+            list_name = lst.get("name") if isinstance(lst.get("name"), str) else "(unnamed)"
+            direct6 = norm_bool(lst.get("direct6"), default=False)
+            resolve6 = lst.get("resolve6")
+            use_direct6 = (
+                direct6
+                and not args.xray
+                and inbound_entries is not None
+                and bool(d6_tags)
+            )
+
+            if direct6 and args.xray:
+                debug_print(f"list {list_name!r}: direct6/#d6 skipped in xray mode")
+
+            if use_direct6:
+                rules.extend(generate_direct6_preamble(d6_tags, resolve6 if isinstance(resolve6, str) else None, list_name))
+                v4_cidrs, v6_cidrs = split_cidrs_v4_v6(cidr_pats)
+                inbound_v6 = inbound_field(non_d6_tags)
+                for o in available_outs:
+                    rules.extend(generate_cidr_rules(inbound_all, v4_cidrs, o, args.xray, block_as_action))
+                    rules.extend(generate_cidr_rules(inbound_v6, v6_cidrs, o, args.xray, block_as_action))
+                    rules.extend(generate_rules(inbound_all, domain_pats, o, args.xray, block_as_action))
+            else:
+                for o in available_outs:
+                    # CIDR before domains (matches inout-split expected order)
+                    rules.extend(generate_cidr_rules(inbound_all, cidr_pats, o, args.xray, block_as_action))
+                    rules.extend(generate_rules(inbound_all, domain_pats, o, args.xray, block_as_action))
 
         # direct
         dp: List[str] = []
@@ -617,10 +733,10 @@ def main():
 
         domain_dp, cidr_dp = split_patterns(dp)
         domain_bp, cidr_bp = split_patterns(bp)
-        rules.extend(generate_rules(inbound, domain_dp, DEFAULT_FINAL_OUTBOUND, args.xray))
-        rules.extend(generate_cidr_rules(inbound, cidr_dp, DEFAULT_FINAL_OUTBOUND, args.xray))
-        rules.extend(generate_rules(inbound, domain_bp, DEFAULT_BLOCK_OUTBOUND, args.xray, block_as_action))
-        rules.extend(generate_cidr_rules(inbound, cidr_bp, DEFAULT_BLOCK_OUTBOUND, args.xray, block_as_action))
+        rules.extend(generate_cidr_rules(inbound_all, cidr_dp, DEFAULT_FINAL_OUTBOUND, args.xray))
+        rules.extend(generate_rules(inbound_all, domain_dp, DEFAULT_FINAL_OUTBOUND, args.xray))
+        rules.extend(generate_cidr_rules(inbound_all, cidr_bp, DEFAULT_BLOCK_OUTBOUND, args.xray, block_as_action))
+        rules.extend(generate_rules(inbound_all, domain_bp, DEFAULT_BLOCK_OUTBOUND, args.xray, block_as_action))
         return rules
 
     # -------- build rules --------
@@ -636,8 +752,10 @@ def main():
         m = re.fullmatch(_PLACEH_RX, tok)
         if not m:
             continue
-        tid, inbound = m.group(1), m.group(2)
-        rules_by_ph[tok] = build_rules_for_profile(tid, inbound)
+        tid, spec = m.group(1), m.group(2)
+        entries = parse_inbound_spec(spec)
+        debug_print(f"{tok}: inbounds={[(n, sorted(f)) for n, f in entries]}")
+        rules_by_ph[tok] = build_rules_for_profile(tid, entries)
 
     # -------- FINAL --------
     final_value = None
