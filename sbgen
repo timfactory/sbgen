@@ -410,20 +410,66 @@ def _sanitize_trailing_commas(s: str) -> str:
     return s
 
 # ---------- placeholders ----------
-_PLACEH_RX = r'%%([^%:\s]+):([^%]+)%%'
+# %%tid:inbounds%%  or  %%tid(out1,out2):inbounds%%
+_PLACEH_RX = r'%%([^%(:\s]+)(?:\(([^%]*)\))?:([^%]+)%%'
 _FINAL_TOKEN = "%%FINAL%%"
+# %%DEFAULTS%%  or  %%DEFAULTS(out1,out2)%%
+_DEFAULTS_RX = r'%%DEFAULTS(?:\(([^%]*)\))?%%'
 _DEFAULTS_TOKEN = "%%DEFAULTS%%"
+
+def parse_outbound_list(s: Optional[str]) -> List[str]:
+    """Split comma-separated outbound tags; trim; drop empties; preserve order, unique."""
+    if not s:
+        return []
+    out: List[str] = []
+    seen: Set[str] = set()
+    for part in s.split(","):
+        t = part.strip()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+def merge_outbound_tags(base: List[str], *extra_lists: List[str]) -> List[str]:
+    seen = set(base)
+    out = list(base)
+    for lst in extra_lists:
+        for t in lst:
+            if isinstance(t, str) and t and t not in seen:
+                seen.add(t)
+                out.append(t)
+    return out
+
+def collect_declared_outs_from_placeholders(placeholders: List[str]) -> List[str]:
+    declared: List[str] = []
+    seen: Set[str] = set()
+    for tok in placeholders:
+        m = re.fullmatch(_DEFAULTS_RX, tok)
+        if m:
+            for t in parse_outbound_list(m.group(1)):
+                if t not in seen:
+                    seen.add(t)
+                    declared.append(t)
+            continue
+        m = re.fullmatch(_PLACEH_RX, tok)
+        if not m:
+            continue
+        for t in parse_outbound_list(m.group(2)):
+            if t not in seen:
+                seen.add(t)
+                declared.append(t)
+    return declared
 
 def _quote_unquoted_placeholders(text: str) -> str:
     text = re.sub(r'(?<!")(' + _PLACEH_RX + r')(?!")', r'"\1"', text)
     text = re.sub(r'(?<!")(' + re.escape(_FINAL_TOKEN) + r')(?!")', r'"\1"', text)
-    text = re.sub(r'(?<!")(' + re.escape(_DEFAULTS_TOKEN) + r')(?!")', r'"\1"', text)
+    text = re.sub(r'(?<!")(' + _DEFAULTS_RX + r')(?!")', r'"\1"', text)
     return text
 
 def _find_placeholders(node):
     f = []
     if isinstance(node, str):
-        if re.fullmatch(_PLACEH_RX, node) or node == _FINAL_TOKEN or node == _DEFAULTS_TOKEN:
+        if re.fullmatch(_PLACEH_RX, node) or node == _FINAL_TOKEN or re.fullmatch(_DEFAULTS_RX, node):
             f.append(node)
     elif isinstance(node, list):
         for i in node:
@@ -490,13 +536,15 @@ def main():
     global DEBUG
 
     ap = argparse.ArgumentParser(description="Generate sing-box/xray JSON from template + YAML config(s).")
-    ap.add_argument("template", help="Path to JSON template with placeholders like %%tid:in1,in2#d6%% or %%DEFAULTS%% (quoted or bare)")
+    ap.add_argument("template", help="Path to JSON template with placeholders like %%tid(out1):in1,in2#d6%% or %%DEFAULTS%% (quoted or bare)")
     ap.add_argument("yamls", nargs="+", help="One or more YAML files with rules")
     ap.add_argument("-v","--verbose", action="store_true", help="Enable debug logging to stderr")
     ap.add_argument("-b","--base-dir", dest="cli_base_dir", default=None,
                     help="Optional base directory for resolving relative 'includes' (used after item/tid base dirs)")
     ap.add_argument("-a","--append", dest="append_rule",
                     help="Append raw fragment (string or JSON) into route/routing.rules[] before placeholder processing")
+    ap.add_argument("-o","--outbound", dest="assume_outbounds", action="append", default=[],
+                    help="Declare outbound tag(s) present in another config fragment (comma-separated; repeatable)")
     ap.add_argument("-x","--xray", action="store_true", help="Xray mode")
     ap.add_argument("-c","--cache-dir", dest="cache_dir", default=DEFAULT_CACHE_DIR,
                     help="Directory for caching URL list downloads (default: %(default)s)")
@@ -507,11 +555,16 @@ def main():
 
     DEBUG = args.verbose
 
+    cli_outs: List[str] = []
+    for item in args.assume_outbounds:
+        cli_outs.extend(parse_outbound_list(item))
+
     if DEBUG:
         _log_proxy_env_if_verbose()
         debug_print(f"Template: {args.template}")
         debug_print(f"YAML files: {args.yamls}")
         debug_print(f"CLI base_dir: {args.cli_base_dir or '(none)'}")
+        debug_print(f"CLI assume outbounds: {cli_outs or '(none)'}")
         debug_print(f"Cache dir: {args.cache_dir} refresh={args.refresh}")
         debug_print(f"Mode: {'xray' if args.xray else 'sing-box'}")
 
@@ -552,12 +605,7 @@ def main():
                     debug_print(f"Appended 1 JSON rule from -a into {section}.rules")
 
     available_tags_list = collect_available_out_tags(tpl_json, args.xray)
-    available_tags = set(available_tags_list)
-    has_block_outbound = DEFAULT_BLOCK_OUTBOUND in available_tags
-    block_as_action = not has_block_outbound and not args.xray
-
-    debug_print(f"Available outbound tags: {available_tags_list}")
-    debug_print(f"Block as action: {block_as_action} (has_block_outbound={has_block_outbound})")
+    # has_block_outbound / block_as_action finalized after placeholder + CLI merge below
 
     # -------- YAML merge --------
     config: Dict[str, Dict[str, Any]] = {}
@@ -635,6 +683,15 @@ def main():
     # -------- find placeholders --------
     placeholders = _find_placeholders(tpl_json)
     debug_print(f"Placeholders in AST (order): {placeholders}")
+
+    ph_outs = collect_declared_outs_from_placeholders(placeholders)
+    available_tags_list = merge_outbound_tags(available_tags_list, cli_outs, ph_outs)
+    available_tags = set(available_tags_list)
+    has_block_outbound = DEFAULT_BLOCK_OUTBOUND in available_tags
+    block_as_action = not has_block_outbound and not args.xray
+    debug_print(f"Declared outs from placeholders: {ph_outs or '(none)'}")
+    debug_print(f"Available outbound tags: {available_tags_list}")
+    debug_print(f"Block as action: {block_as_action} (has_block_outbound={has_block_outbound})")
 
     def build_rules_for_profile(
         tid: str,
@@ -743,18 +800,19 @@ def main():
     rules_by_ph: Dict[str, List[Dict[str, Any]]] = {}
 
     for tok in placeholders:
-        if tok == _DEFAULTS_TOKEN:
+        md = re.fullmatch(_DEFAULTS_RX, tok)
+        if md:
             rules = build_rules_for_profile(DEFAULT_PROFILE_TID, None)
-            debug_print(f"{_DEFAULTS_TOKEN}: {len(rules)} rule(s) from tid={DEFAULT_PROFILE_TID!r} (no inbound)")
+            debug_print(f"{tok}: {len(rules)} rule(s) from tid={DEFAULT_PROFILE_TID!r} (no inbound)")
             rules_by_ph[tok] = rules
             continue
 
         m = re.fullmatch(_PLACEH_RX, tok)
         if not m:
             continue
-        tid, spec = m.group(1), m.group(2)
+        tid, spec = m.group(1), m.group(3)
         entries = parse_inbound_spec(spec)
-        debug_print(f"{tok}: inbounds={[(n, sorted(f)) for n, f in entries]}")
+        debug_print(f"{tok}: tid={tid!r} declared_outs={parse_outbound_list(m.group(2))} inbounds={[(n, sorted(f)) for n, f in entries]}")
         rules_by_ph[tok] = build_rules_for_profile(tid, entries)
 
     # -------- FINAL --------

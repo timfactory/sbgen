@@ -31,6 +31,7 @@ sbgen <template.tpl> <config.yml> [more.yml...] [опции]
 - `-c, --cache-dir DIR` — Директория кэша для загружаемых по URL списков (по умолчанию: `~/.cache/sbgen`)
 - `-r, --refresh` — Принудительно перезагружать списки по URL (при ошибке используется старый кэш)
 - `-a, --append RULE` — Добавить сырой фрагмент (строка или JSON) в `route.rules[]` или `routing.rules[]` перед обработкой плейсхолдеров
+- `-o, --outbound TAG[,TAG...]` — Объявить outbound-теги, которые есть в другом фрагменте конфига (через запятую; опцию можно повторять). Дополняют теги из `outbounds[]` шаблона и из `%%tid(outs):…%%`
 - `-x, --xray` — Генерировать конфигурацию в стиле Xray/V2Ray вместо sing-box
 
 **Примеры:**
@@ -49,6 +50,9 @@ sbgen <template.tpl> <config.yml> [more.yml...] [опции]
 
 # Добавление пользовательского правила
 ./sbgen template.tpl config.yml -a '{"domain":["example.com"],"outbound":"proxy"}' > config.json
+
+# Фрагмент без секции outbounds: теги задаются через -o
+./sbgen standalone-inout-split.tpl profiles.yml -o out-isl,out-world,proxy > fragment.json
 ```
 
 Если один из указанных файлов не существует — утилита завершит работу с ошибкой.
@@ -155,6 +159,7 @@ russia:
 
 ```text
 %%russia:in-russia-split,in-russia-split4#d6%%
+%%russia(out-isl,out-world,proxy):in-russia-split,in-russia-split4#d6%%
 ```
 
 - Несколько inbound → в правиле `"inbound": ["in-russia-split", "in-russia-split4"]` (один inbound остаётся строкой).
@@ -172,6 +177,24 @@ russia:
 ```
 
 Порядок правил для такого list: preamble (`resolve` + `::/0`) → IPv4 CIDR → IPv6 CIDR (без `#d6`) → domains.
+
+---
+
+## 📦 Декларация outbound’ов для фрагментов
+
+По умолчанию `list.out` попадает в правила только если тег есть в `outbounds[]` шаблона. Для фрагмента маршрутизации (outbound’ы в другом файле) теги можно **объявить** — они дополняют (union), а не заменяют, теги из шаблона:
+
+1. **В плейсхолдере** — опциональные скобки после tid:
+   ```text
+   %%russia(out-isl,out-world,proxy):in-tun%%
+   %%DEFAULTS(direct,block)%%
+   ```
+2. **CLI** — `-o` / `--outbound` (через запятую, опцию можно повторять):
+   ```bash
+   ./sbgen frag.tpl profiles.yml -o out-isl,out-world -o proxy
+   ```
+
+Объявления из всех плейсхолдеров и из `-o` сливаются в один набор на весь прогон.
 
 ---
 
@@ -501,16 +524,11 @@ russia:
     { "tag": "in-russia-split",  "type": "mixed", "listen": "0.0.0.0", "listen_port": 11001 },
     { "tag": "in-russia-split4", "type": "mixed", "listen": "0.0.0.0", "listen_port": 11005 }
   ],
-  "outbounds": [
-    { "tag": "out-isl", "type": "direct" },
-    { "tag": "out-world", "type": "direct" },
-    { "tag": "direct", "type": "direct" }
-  ],
   "route": {
     "rules": [
       { "inbound": "in-russia-split",  "action": "sniff" },
       { "inbound": "in-russia-split4", "action": "sniff" },
-      %%russia:in-russia-split,in-russia-split4#d6%%
+      %%russia(out-isl,out-world):in-russia-split,in-russia-split4#d6%%
     ],
     "final": "direct"
   }
@@ -534,7 +552,7 @@ russia:
 ]
 ```
 
-На `in-russia-split4` IPv6 для list `world` уходит в `direct`; IPv6 CIDR проксируется только через `in-russia-split`.
+На `in-russia-split4` IPv6 для list `world` уходит в `direct`; IPv6 CIDR проксируется только через `in-russia-split`. Скобки `(out-isl,out-world)` объявляют outbound’ы без секции `outbounds[]` в шаблоне (см. [Декларация outbound’ов для фрагментов](#-декларация-outboundов-для-фрагментов)).
 
 ---
 

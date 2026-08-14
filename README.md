@@ -31,6 +31,7 @@ sbgen <template.tpl> <config.yml> [more.yml...] [options]
 - `-c, --cache-dir DIR` — Cache directory for URL-fetched lists (default: `~/.cache/sbgen`)
 - `-r, --refresh` — Force re-download of URL lists (on failure, existing cache is used)
 - `-a, --append RULE` — Append raw fragment (string or JSON) into `route.rules[]` or `routing.rules[]` before placeholder processing
+- `-o, --outbound TAG[,TAG...]` — Declare outbound tags that exist in another config fragment (comma-separated; repeatable). Unions with tags from template `outbounds[]` and from `%%tid(outs):…%%`
 - `-x, --xray` — Generate Xray/V2Ray style configuration instead of sing-box
 
 **Examples:**
@@ -49,6 +50,9 @@ sbgen <template.tpl> <config.yml> [more.yml...] [options]
 
 # Append custom rule
 ./sbgen template.tpl config.yml -a '{"domain":["example.com"],"outbound":"proxy"}' > config.json
+
+# Fragment without outbounds section: declare tags via -o
+./sbgen standalone-inout-split.tpl profiles.yml -o out-isl,out-world,proxy > fragment.json
 ```
 
 If any of the specified files do not exist, the tool exits with an error.
@@ -155,6 +159,7 @@ The `%%tid:…%%` placeholder accepts one or more inbounds, comma-separated. Aft
 
 ```text
 %%russia:in-russia-split,in-russia-split4#d6%%
+%%russia(out-isl,out-world,proxy):in-russia-split,in-russia-split4#d6%%
 ```
 
 - Multiple inbounds → `"inbound": ["in-russia-split", "in-russia-split4"]` (a single inbound stays a string).
@@ -172,6 +177,24 @@ Example list:
 ```
 
 Rule order for such a list: preamble (`resolve` + `::/0`) → IPv4 CIDR → IPv6 CIDR (non-`#d6`) → domains.
+
+---
+
+## 📦 Declaring outbounds for fragments
+
+By default a `list.out` is emitted only if the tag exists in the template `outbounds[]`. For a routing fragment (outbounds live elsewhere), declare tags — they **union** with template tags:
+
+1. **In the placeholder** — optional parentheses after tid:
+   ```text
+   %%russia(out-isl,out-world,proxy):in-tun%%
+   %%DEFAULTS(direct,block)%%
+   ```
+2. **CLI** — `-o` / `--outbound` (comma-separated; repeatable):
+   ```bash
+   ./sbgen frag.tpl profiles.yml -o out-isl,out-world -o proxy
+   ```
+
+Declarations from all placeholders and from `-o` merge into one set for the whole run.
 
 ---
 
@@ -501,16 +524,11 @@ russia:
     { "tag": "in-russia-split",  "type": "mixed", "listen": "0.0.0.0", "listen_port": 11001 },
     { "tag": "in-russia-split4", "type": "mixed", "listen": "0.0.0.0", "listen_port": 11005 }
   ],
-  "outbounds": [
-    { "tag": "out-isl", "type": "direct" },
-    { "tag": "out-world", "type": "direct" },
-    { "tag": "direct", "type": "direct" }
-  ],
   "route": {
     "rules": [
       { "inbound": "in-russia-split",  "action": "sniff" },
       { "inbound": "in-russia-split4", "action": "sniff" },
-      %%russia:in-russia-split,in-russia-split4#d6%%
+      %%russia(out-isl,out-world):in-russia-split,in-russia-split4#d6%%
     ],
     "final": "direct"
   }
@@ -534,7 +552,7 @@ russia:
 ]
 ```
 
-On `in-russia-split4`, IPv6 for list `world` goes `direct`; IPv6 CIDRs are proxied only via `in-russia-split`.
+On `in-russia-split4`, IPv6 for list `world` goes `direct`; IPv6 CIDRs are proxied only via `in-russia-split`. The `(out-isl,out-world)` parentheses declare outbounds without an `outbounds[]` section in the template (see [Declaring outbounds for fragments](#-declaring-outbounds-for-fragments)).
 
 ---
 
